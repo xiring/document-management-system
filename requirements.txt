@@ -5,7 +5,8 @@ psycopg2-binary>=2.9.9
 python-multipart>=0.0.6
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
-bcrypt>=4.0.0,<5
+# bcrypt 4.1+ drops __about__; passlib 1.7.4 still expects it
+bcrypt>=4.0.1,<4.1
 pydantic-settings>=2.1.0
 email-validator>=2.0.0
 web3>=6.11.0

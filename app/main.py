@@ -10,10 +10,13 @@ from sqlalchemy.orm import Session
 load_dotenv()
 
 from app.auth import create_access_token, get_current_user, hash_password, verify_password
-from app.database import Base, engine, get_db
+from app.config import settings
+from app.database import Base, engine, ensure_users_role_column, get_db, promote_bootstrap_admin_if_configured
 from app.models import Document, User
 from app.blockchain_service import get_on_chain_owner, is_notarization_configured, notarize_hash
-from app.schemas import DocumentOut, DocumentVerifyResult, Token, UserCreate, UserOut
+from app.permissions import RequirePermission, can_access_document, has_permission
+from app.roles import Role
+from app.schemas import DocumentOut, DocumentVerifyResult, Token, UserCreate, UserOut, UserRoleUpdate
 from app.services.storage import read_stored_file, save_upload, sha256_bytes
 
 
@@ -36,10 +39,21 @@ def document_to_out(doc: Document) -> DocumentOut:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    ensure_users_role_column()
+    promote_bootstrap_admin_if_configured()
     yield
 
 
 app = FastAPI(title="DMS", lifespan=lifespan)
+
+
+def _initial_role_for_email(email: str) -> str:
+    if (
+        settings.bootstrap_admin_email
+        and email.lower() == settings.bootstrap_admin_email.strip().lower()
+    ):
+        return Role.admin.value
+    return Role.user.value
 
 
 @app.post("/auth/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -47,7 +61,11 @@ def register(body: UserCreate, db: Annotated[Session, Depends(get_db)]) -> UserO
     existing = db.execute(select(User).where(User.email == body.email)).scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
-    user = User(email=body.email, hashed_password=hash_password(body.password))
+    user = User(
+        email=body.email,
+        hashed_password=hash_password(body.password),
+        role=_initial_role_for_email(body.email),
+    )
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -68,7 +86,7 @@ def login(
 
 @app.post("/documents/upload", response_model=DocumentOut)
 async def upload_document(
-    current_user: Annotated[User, Depends(get_current_user)],
+    current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
     db: Annotated[Session, Depends(get_db)],
     file: UploadFile = File(...),
 ) -> DocumentOut:
@@ -97,7 +115,14 @@ def list_documents(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> list[DocumentOut]:
-    rows = db.execute(select(Document).where(Document.owner_id == current_user.id)).scalars().all()
+    if not has_permission(current_user, "documents:read"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing permission: documents:read")
+    if has_permission(current_user, "documents:read_all"):
+        rows = db.execute(select(Document)).scalars().all()
+    else:
+        rows = (
+            db.execute(select(Document).where(Document.owner_id == current_user.id)).scalars().all()
+        )
     return [document_to_out(d) for d in rows]
 
 
@@ -107,8 +132,10 @@ def get_document(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> DocumentOut:
+    if not has_permission(current_user, "documents:read"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing permission: documents:read")
     doc = db.get(Document, document_id)
-    if doc is None or doc.owner_id != current_user.id:
+    if doc is None or not can_access_document(current_user, doc):
         raise HTTPException(status_code=404, detail="Document not found")
     return document_to_out(doc)
 
@@ -116,7 +143,7 @@ def get_document(
 @app.post("/documents/{document_id}/versions", response_model=DocumentOut)
 async def upload_new_version(
     document_id: int,
-    current_user: Annotated[User, Depends(get_current_user)],
+    current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
     db: Annotated[Session, Depends(get_db)],
     file: UploadFile = File(...),
 ) -> DocumentOut:
@@ -155,11 +182,11 @@ def _newer_version_document_id(db: Session, doc: Document) -> int | None:
 @app.get("/documents/{document_id}/verify", response_model=DocumentVerifyResult)
 def verify_document(
     document_id: int,
-    current_user: Annotated[User, Depends(get_current_user)],
+    current_user: Annotated[User, Depends(RequirePermission("documents:verify"))],
     db: Annotated[Session, Depends(get_db)],
 ) -> DocumentVerifyResult:
     doc = db.get(Document, document_id)
-    if doc is None or doc.owner_id != current_user.id:
+    if doc is None or not can_access_document(current_user, doc):
         raise HTTPException(status_code=404, detail="Document not found")
 
     successor_id = _newer_version_document_id(db, doc)
@@ -232,6 +259,31 @@ def verify_document(
         newer_version_document_id=successor_id,
         message=" ".join(parts),
     )
+
+
+@app.get("/admin/users", response_model=list[UserOut])
+def admin_list_users(
+    _: Annotated[User, Depends(RequirePermission("users:manage"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> list[UserOut]:
+    rows = db.execute(select(User).order_by(User.id)).scalars().all()
+    return [UserOut.model_validate(u) for u in rows]
+
+
+@app.patch("/admin/users/{user_id}/role", response_model=UserOut)
+def admin_set_user_role(
+    user_id: int,
+    body: UserRoleUpdate,
+    _: Annotated[User, Depends(RequirePermission("users:manage"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> UserOut:
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    target.role = body.role
+    db.commit()
+    db.refresh(target)
+    return UserOut.model_validate(target)
 
 
 @app.get("/health")

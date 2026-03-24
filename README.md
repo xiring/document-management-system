@@ -56,22 +56,40 @@ See `.env.example` for the full list. Important fields:
 | `PRIVATE_KEY` | Hex key for signing notarization transactions (optional; never commit) |
 | `CONTRACT_ADDRESS` | Deployed `DocumentNotary` contract (optional) |
 | `CHAIN_ID` | Network chain ID (e.g. `1`, `137` for Polygon) |
+| `BOOTSTRAP_ADMIN_EMAIL` | Optional. **On registration**, this email gets `admin`. **On every startup**, if a user with this email exists and is not admin yet, they are promoted to `admin` (so you can fix access without SQL) |
 
 If `ETH_RPC_URL`, `CONTRACT_ADDRESS`, or `PRIVATE_KEY` is missing, uploads still work but **on-chain notarization is skipped** (`blockchain_tx_hash` may be null).
 
+## Roles and permissions
+
+Each user has a `role` stored in PostgreSQL (`admin`, `manager`, `user`, or `viewer`). Permissions are fixed per role:
+
+| Role | Capabilities |
+| --- | --- |
+| **admin** | All document actions; list **all** users’ documents; manage users (`users:manage`) |
+| **manager** | Same as user, plus list/read/verify **any** user’s documents |
+| **user** | Upload and version **own** documents; list/read/verify own |
+| **viewer** | Read and verify **own** documents only (no uploads) |
+
+New registrations default to `user`. Set `BOOTSTRAP_ADMIN_EMAIL` before the first admin registers, or promote users with `PATCH /admin/users/{id}/role` (admins only). After a role change, the user should request a new JWT (`POST /auth/token`) so clients reflect the new role (the API always loads the role from the database on each request).
+
+On startup, PostgreSQL databases that predate the `users.role` column get `ALTER TABLE ... ADD COLUMN IF NOT EXISTS role ...` applied automatically.
+
 ## API overview
 
-All `/documents/*` routes require `Authorization: Bearer <token>`.
+Protected routes require `Authorization: Bearer <token>`. Access depends on role; insufficient permission returns **403**.
 
 | Method | Path | Description |
 | --- | --- | --- |
 | `POST` | `/auth/register` | Register with JSON body `email`, `password` |
 | `POST` | `/auth/token` | OAuth2 form: `username` = email, `password` |
-| `POST` | `/documents/upload` | Multipart file upload; hashes **content** with SHA-256 |
-| `GET` | `/documents` | List current user’s documents |
-| `GET` | `/documents/{id}` | Get one document |
-| `POST` | `/documents/{id}/versions` | Upload a new version (new row, linked to parent) |
-| `GET` | `/documents/{id}/verify` | Re-hash file on disk; compares to DB and optionally chain |
+| `POST` | `/documents/upload` | Multipart upload (requires `documents:write`) |
+| `GET` | `/documents` | List documents (own only, or all if `manager`/`admin`) |
+| `GET` | `/documents/{id}` | Get metadata (own, or any if `manager`/`admin`) |
+| `POST` | `/documents/{id}/versions` | New version for **your** document only |
+| `GET` | `/documents/{id}/verify` | Content verification |
+| `GET` | `/admin/users` | List users (`admin` only) |
+| `PATCH` | `/admin/users/{id}/role` | Set user role (`admin` only), body `{"role":"viewer"}` |
 | `GET` | `/health` | Liveness check |
 
 The `content_sha256_hex` field in responses is the digest of **file bytes**, not the filename.
@@ -90,6 +108,8 @@ app/
   schemas.py           # Pydantic models
   auth.py              # JWT and password hashing
   config.py            # Settings from environment
+  roles.py             # Role enum and permission sets
+  permissions.py       # Dependency injection for route permissions
   blockchain_service.py # Web3 notarization helpers
   services/
     storage.py         # Local file IO and hashing
@@ -98,6 +118,19 @@ contracts/
 .env.example
 requirements.txt
 ```
+
+## Troubleshooting
+
+### `403` on `PATCH /admin/users/.../role`
+
+Only users with role **`admin`** may change roles. Either:
+
+1. Set `BOOTSTRAP_ADMIN_EMAIL` in `.env` to the **same email** as your existing account, restart the API, and the app will promote that user to admin on startup; or  
+2. Run SQL: `UPDATE users SET role = 'admin' WHERE id = 1;` (adjust `id` / email as needed).
+
+### `(trapped) error reading bcrypt version` / `bcrypt has no attribute '__about__'`
+
+The app pins `bcrypt` to `<4.1` for compatibility with `passlib`. Reinstall: `pip install -r requirements.txt`.
 
 ## Security
 

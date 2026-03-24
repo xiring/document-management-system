@@ -1,6 +1,8 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+from app.roles import normalize_role
 
 
 class UserCreate(BaseModel):
@@ -11,9 +13,19 @@ class UserCreate(BaseModel):
 class UserOut(BaseModel):
     id: int
     email: str
+    role: str
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class UserRoleUpdate(BaseModel):
+    role: str = Field(description="One of: admin, manager, user, viewer")
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        return normalize_role(v).value
 
 
 class Token(BaseModel):

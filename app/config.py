@@ -17,5 +17,8 @@ class Settings(BaseSettings):
     contract_address: str = ""
     chain_id: int = 1
 
+    # If set, the first registration with this email (case-insensitive) gets `admin` role.
+    bootstrap_admin_email: str = ""
+
 
 settings = Settings()
