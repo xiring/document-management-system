@@ -20,5 +20,8 @@ class Settings(BaseSettings):
     # If set, the first registration with this email (case-insensitive) gets `admin` role.
     bootstrap_admin_email: str = ""
 
+    # Optional: set retention_expires_at on new uploads to now + N days (UTC).
+    default_retention_days: int | None = None
+
 
 settings = Settings()

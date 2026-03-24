@@ -163,6 +163,9 @@ class DocumentOut(BaseModel):
     blockchain_tx_hash: str | None
     version: int
     previous_version_id: int | None
+    deleted_at: datetime | None = None
+    legal_hold: bool = False
+    retention_expires_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -177,6 +180,18 @@ class DocumentMetadataUpdate(BaseModel):
         default=None,
         description="Replace all collection memberships for this document; omit to leave unchanged.",
     )
+    legal_hold: bool | None = Field(
+        default=None,
+        description="When true, document cannot be soft-deleted until cleared.",
+    )
+    retention_expires_at: datetime | None = Field(
+        default=None,
+        description="UTC instant after which auto-retention may soft-delete (unless legal hold).",
+    )
+
+
+class RetentionApplyOut(BaseModel):
+    soft_deleted_count: int
 
 
 class DocumentListResponse(BaseModel):

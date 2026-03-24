@@ -50,6 +50,27 @@ def ensure_folder_tree_schema() -> None:
         )
 
 
+def ensure_document_retention_columns() -> None:
+    """Soft delete, legal hold, retention expiry columns on documents (PostgreSQL)."""
+    if not settings.database_url.startswith("postgresql"):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL"))
+            conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS legal_hold BOOLEAN NOT NULL DEFAULT false"
+                )
+            )
+            conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS retention_expires_at TIMESTAMPTZ NULL"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_deleted_at ON documents (deleted_at)"))
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_documents_retention_expires ON documents (retention_expires_at)")
+            )
+    except Exception as e:
+        logger.warning("Document retention columns could not be applied. Error: %s", e)
+
+
 def ensure_organization_columns() -> None:
     """Add folder_id to documents if missing (PostgreSQL; folders table must exist)."""
     if not settings.database_url.startswith("postgresql"):

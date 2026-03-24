@@ -1,11 +1,11 @@
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, selectinload
 
 load_dotenv()
@@ -16,6 +16,7 @@ from app.database import (
     Base,
     engine,
     ensure_folder_tree_schema,
+    ensure_document_retention_columns,
     ensure_organization_columns,
     ensure_pg_trgm,
     ensure_users_role_column,
@@ -34,6 +35,7 @@ from app.schemas import (
     DocumentMetadataUpdate,
     DocumentOut,
     DocumentVerifyResult,
+    RetentionApplyOut,
     Token,
     UserCreate,
     UserOut,
@@ -61,6 +63,9 @@ def document_to_out(doc: Document) -> DocumentOut:
         blockchain_tx_hash=doc.blockchain_tx_hash,
         version=doc.version,
         previous_version_id=doc.previous_version_id,
+        deleted_at=doc.deleted_at,
+        legal_hold=bool(doc.legal_hold),
+        retention_expires_at=doc.retention_expires_at,
     )
 
 
@@ -78,6 +83,7 @@ async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     ensure_users_role_column()
     ensure_organization_columns()
+    ensure_document_retention_columns()
     ensure_folder_tree_schema()
     ensure_pg_trgm()
     promote_bootstrap_admin_if_configured()
@@ -145,6 +151,9 @@ async def upload_document(
     fid = _resolve_folder_for_owner(db, folder_id, current_user.id)
     storage_uri, digest = save_upload(content, file.filename or "unnamed")
     tx_hash = notarize_hash(digest)
+    retention: datetime | None = None
+    if settings.default_retention_days is not None and settings.default_retention_days > 0:
+        retention = datetime.now(timezone.utc) + timedelta(days=settings.default_retention_days)
     doc = Document(
         filename=file.filename or "unnamed",
         owner_id=current_user.id,
@@ -154,6 +163,7 @@ async def upload_document(
         blockchain_tx_hash=tx_hash,
         version=1,
         previous_version_id=None,
+        retention_expires_at=retention,
     )
     db.add(doc)
     db.commit()
@@ -205,9 +215,22 @@ def list_documents(
         description="Documents that have ALL of these tag ids (AND).",
     ),
     collection_id: int | None = Query(default=None, description="Filter by membership in this collection."),
+    include_deleted: bool = Query(
+        default=False,
+        description="Include soft-deleted rows (managers/admins auditing).",
+    ),
+    trash_only: bool = Query(
+        default=False,
+        description="Only soft-deleted rows (trash).",
+    ),
 ) -> DocumentListResponse:
     if not has_permission(current_user, "documents:read"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing permission: documents:read")
+    if trash_only and include_deleted:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot use trash_only=true together with include_deleted=true",
+        )
     if (
         version_min is not None
         and version_max is not None
@@ -254,6 +277,8 @@ def list_documents(
             folder_id=folder_id,
             tag_ids=tag_ids or None,
             collection_id=collection_id,
+            include_deleted=include_deleted,
+            trash_only=trash_only,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -273,6 +298,10 @@ def get_document(
     document_id: int,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
+    include_deleted: bool = Query(
+        default=False,
+        description="Return soft-deleted documents (e.g. trash inspection).",
+    ),
 ) -> DocumentOut:
     if not has_permission(current_user, "documents:read"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing permission: documents:read")
@@ -286,6 +315,8 @@ def get_document(
         .where(Document.id == document_id)
     ).scalar_one_or_none()
     if doc is None or not can_access_document(current_user, doc):
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.deleted_at is not None and not include_deleted:
         raise HTTPException(status_code=404, detail="Document not found")
     return document_to_out(doc)
 
@@ -307,6 +338,8 @@ def update_document_metadata(
     ).scalar_one_or_none()
     if doc is None or doc.owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Document not found")
+    if doc.deleted_at is not None:
+        raise HTTPException(status_code=409, detail="Document is deleted; restore before editing metadata")
     patch = body.model_dump(exclude_unset=True)
     if "folder_id" in patch:
         if patch["folder_id"] is None:
@@ -338,6 +371,49 @@ def update_document_metadata(
             if len(cols) != len(set(cids)):
                 raise HTTPException(status_code=400, detail="Invalid or duplicate collection ids")
             doc.collections = list(cols)
+    if "legal_hold" in patch:
+        doc.legal_hold = bool(patch["legal_hold"])
+    if "retention_expires_at" in patch:
+        doc.retention_expires_at = patch["retention_expires_at"]
+    db.commit()
+    db.refresh(doc)
+    return document_to_out(doc)
+
+
+@app.delete("/documents/{document_id}", response_model=DocumentOut)
+def soft_delete_document(
+    document_id: int,
+    current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> DocumentOut:
+    doc = db.get(Document, document_id)
+    if doc is None or doc.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.deleted_at is not None:
+        raise HTTPException(status_code=409, detail="Document is already deleted")
+    if doc.legal_hold:
+        raise HTTPException(
+            status_code=409,
+            detail="Document is under legal hold; clear legal_hold before delete.",
+        )
+    doc.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(doc)
+    return document_to_out(doc)
+
+
+@app.post("/documents/{document_id}/restore", response_model=DocumentOut)
+def restore_document(
+    document_id: int,
+    current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> DocumentOut:
+    doc = db.get(Document, document_id)
+    if doc is None or doc.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.deleted_at is None:
+        raise HTTPException(status_code=409, detail="Document is not deleted")
+    doc.deleted_at = None
     db.commit()
     db.refresh(doc)
     return document_to_out(doc)
@@ -357,6 +433,11 @@ async def upload_new_version(
     ).scalar_one_or_none()
     if parent is None or parent.owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Document not found")
+    if parent.deleted_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot upload a new version while the document is deleted; restore first.",
+        )
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
@@ -371,6 +452,8 @@ async def upload_new_version(
         blockchain_tx_hash=tx_hash,
         version=parent.version + 1,
         previous_version_id=parent.id,
+        legal_hold=parent.legal_hold,
+        retention_expires_at=parent.retention_expires_at,
     )
     db.add(new_doc)
     db.flush()
@@ -395,9 +478,15 @@ def verify_document(
     document_id: int,
     current_user: Annotated[User, Depends(RequirePermission("documents:verify"))],
     db: Annotated[Session, Depends(get_db)],
+    include_deleted: bool = Query(
+        default=False,
+        description="Allow verifying a soft-deleted document (e.g. audit).",
+    ),
 ) -> DocumentVerifyResult:
     doc = db.get(Document, document_id)
     if doc is None or not can_access_document(current_user, doc):
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.deleted_at is not None and not include_deleted:
         raise HTTPException(status_code=404, detail="Document not found")
 
     successor_id = _newer_version_document_id(db, doc)
@@ -478,7 +567,9 @@ def _count_users_with_role(db: Session, role: str) -> int:
 
 def _count_documents_for_user(db: Session, user_id: int) -> int:
     return db.execute(
-        select(func.count()).select_from(Document).where(Document.owner_id == user_id)
+        select(func.count())
+        .select_from(Document)
+        .where(Document.owner_id == user_id, Document.deleted_at.is_(None))
     ).scalar_one()
 
 
@@ -502,6 +593,27 @@ def _assert_can_remove_admin(db: Session, target: User) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete the only admin.",
         )
+
+
+@app.post("/admin/retention/apply", response_model=RetentionApplyOut)
+def admin_apply_retention(
+    _: Annotated[User, Depends(RequirePermission("users:manage"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> RetentionApplyOut:
+    """Soft-delete active documents whose retention window has passed (skips legal hold)."""
+    now = datetime.now(timezone.utc)
+    res = db.execute(
+        update(Document)
+        .where(
+            Document.deleted_at.is_(None),
+            Document.legal_hold.is_(False),
+            Document.retention_expires_at.is_not(None),
+            Document.retention_expires_at < now,
+        )
+        .values(deleted_at=now)
+    )
+    db.commit()
+    return RetentionApplyOut(soft_deleted_count=int(res.rowcount or 0))
 
 
 @app.get("/admin/users", response_model=list[UserOut])

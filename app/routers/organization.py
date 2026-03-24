@@ -125,7 +125,9 @@ def get_document_tree(
         select(Folder).where(Folder.owner_id == effective_owner).order_by(Folder.name)
     ).scalars().all()
     documents = db.execute(
-        select(Document).where(Document.owner_id == effective_owner).order_by(Document.filename)
+        select(Document)
+        .where(Document.owner_id == effective_owner, Document.deleted_at.is_(None))
+        .order_by(Document.filename)
     ).scalars().all()
     return _build_document_tree(effective_owner, list(folders), list(documents))
 

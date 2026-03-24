@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -121,6 +122,16 @@ class Document(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     previous_version_id: Mapped[int | None] = mapped_column(
         ForeignKey("documents.id"), nullable=True, index=True
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    legal_hold: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        default=False,
+    )
+    retention_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
     )
 
     owner: Mapped["User"] = relationship("User", back_populates="documents")

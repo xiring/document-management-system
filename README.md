@@ -85,21 +85,24 @@ Protected routes require `Authorization: Bearer <token>`. Access depends on role
 | `POST` | `/auth/token` | OAuth2 form: `username` = email, `password` |
 | `GET` | `/auth/me` | Current user profile (any authenticated user) |
 | `POST` | `/documents/upload` | Multipart upload + optional form field `folder_id` (`documents:write`) |
-| `PATCH` | `/documents/{id}` | Metadata: `folder_id`, `tag_ids`, `collection_ids` (partial JSON; `documents:write`, owner only) |
-| `GET` | `/documents` | Search & list: `{ items, total, skip, limit }`. Extra filters: `folder_id`, `tag_ids` (repeat param; AND), `collection_id`, plus filename/hash/date/version filters (see Document search below) |
+| `PATCH` | `/documents/{id}` | Metadata: `folder_id`, `tag_ids`, `collection_ids`, `legal_hold`, `retention_expires_at` (partial JSON; `documents:write`, owner only; 409 if soft-deleted) |
+| `DELETE` | `/documents/{id}` | Soft-delete: sets `deleted_at` (409 if `legal_hold` or already deleted; `documents:write`, owner only) |
+| `POST` | `/documents/{id}/restore` | Clear `deleted_at` (`documents:write`, owner only; 409 if not deleted) |
+| `GET` | `/documents` | Search & list: `{ items, total, skip, limit }`. Query `include_deleted`, `trash_only` for trash; plus `folder_id`, `tag_ids`, `collection_id`, filename/hash/date/version filters (see Document search below) |
 | `GET` | `/folders/tree` | Document tree: nested folders + document summaries + orphans; optional `owner_id` (read_all) |
 | `GET`–`POST` | `/folders`, `/folders/{id}` | Folder CRUD (see Folders, tags, and collections) |
 | `GET`–`POST`–`DELETE` | `/tags`, `/tags/{id}` | Tag CRUD |
 | `GET`–`POST`–`PATCH`–`DELETE` | `/collections`, `/collections/{id}`, … | Collections + document membership |
-| `GET` | `/documents/{id}` | Get metadata (own, or any if `manager`/`admin`) |
-| `POST` | `/documents/{id}/versions` | New version for **your** document only |
-| `GET` | `/documents/{id}/verify` | Content verification |
+| `GET` | `/documents/{id}` | Get metadata; query `include_deleted` to read trashed rows (own, or any if `manager`/`admin`) |
+| `POST` | `/documents/{id}/versions` | New version for **your** document only (409 if parent is soft-deleted) |
+| `GET` | `/documents/{id}/verify` | Content verification; query `include_deleted` to verify a trashed row |
 | `GET` | `/admin/users` | List users with pagination: `skip`, `limit` (default 100, max 500; `users:manage`) |
 | `GET` | `/admin/users/{id}` | Get one user (`users:manage`) |
 | `POST` | `/admin/users` | Create user: `email`, `password`, optional `role` (`users:manage`) |
 | `PATCH` | `/admin/users/{id}` | Partial update: any of `email`, `role`, `password` (`users:manage`) |
 | `PATCH` | `/admin/users/{id}/role` | Set role only (shortcut; `users:manage`) |
-| `DELETE` | `/admin/users/{id}` | Delete user if they own no documents; cannot delete self or the last admin (`users:manage`) |
+| `DELETE` | `/admin/users/{id}` | Delete user if they own no **active** (non-deleted) documents; cannot delete self or the last admin (`users:manage`) |
+| `POST` | `/admin/retention/apply` | Soft-delete documents past `retention_expires_at` (skips `legal_hold`); returns `soft_deleted_count` (`users:manage`) |
 | `GET` | `/health` | Liveness check |
 
 The `content_sha256_hex` field in responses is the digest of **file bytes**, not the filename.
@@ -110,7 +113,13 @@ The `content_sha256_hex` field in responses is the digest of **file bytes**, not
 - **Tags** — `GET/POST /tags`, `DELETE /tags/{id}`. Labels per user; attach via `PATCH /documents/{id}` with `tag_ids` (replaces the set). `POST /tags` returns existing tag if the name already exists.
 - **Collections** — named groups: `GET/POST /collections`, `GET/PATCH/DELETE /collections/{id}`, and `POST/DELETE /collections/{id}/documents/{document_id}` to add/remove a document. `PATCH /documents/{id}` with `collection_ids` replaces membership in all listed collections (omit field to leave unchanged).
 
-`DocumentOut` includes `folder_id`, `tag_ids`, and `collection_ids`. New document versions inherit folder, tags, and collections from the parent row.
+`DocumentOut` includes `folder_id`, `tag_ids`, `collection_ids`, `deleted_at`, `legal_hold`, and `retention_expires_at`. New document versions inherit folder, tags, collections, `legal_hold`, and `retention_expires_at` from the parent row.
+
+### Soft delete and retention
+
+- **Soft delete** — `DELETE /documents/{id}` sets `deleted_at` (UTC). **Legal hold** blocks delete until `PATCH` clears `legal_hold`. **Restore** — `POST /documents/{id}/restore`.
+- **Listing** — Default lists omit trashed rows. Use `trash_only=true` for trash, or `include_deleted=true` to include both (not both at once).
+- **Retention** — Optional `DEFAULT_RETENTION_DAYS` sets `retention_expires_at` on **new uploads** (`now + N days`, UTC). Admins (or a cron job) call `POST /admin/retention/apply` to soft-delete rows where `retention_expires_at` is in the past, `legal_hold` is false, and the document is not already deleted.
 
 ### Document search (`GET /documents`)
 
@@ -118,6 +127,7 @@ The `content_sha256_hex` field in responses is the digest of **file bytes**, not
 - **`q` + `search_mode=trigram`**: fuzzy match using PostgreSQL `pg_trgm` (`similarity()`). Requires the `pg_trgm` extension (the app attempts `CREATE EXTENSION` on startup; hosted DBs without superuser may log a warning and fall back to substring-only).
 - **Filters**: `owner_id` (managers/admins only), `folder_id`, `collection_id`, `tag_ids` (repeat the query param; document must match **all** listed tags), ISO datetimes, `content_sha256_hex`, `version` / `version_min` / `version_max`.
 - **Pagination**: `skip` and optional `limit` (1–5000; omit `limit` for no cap—use carefully).
+- **Trash**: `include_deleted`, `trash_only` (see Soft delete and retention above).
 
 ## Smart contract
 

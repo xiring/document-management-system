@@ -40,8 +40,15 @@ def build_document_list_filters(
     folder_id: int | None,
     tag_ids: list[int] | None,
     collection_id: int | None,
+    include_deleted: bool,
+    trash_only: bool,
 ) -> list[Any]:
     conditions: list[Any] = []
+
+    if trash_only:
+        conditions.append(Document.deleted_at.isnot(None))
+    elif not include_deleted:
+        conditions.append(Document.deleted_at.is_(None))
 
     if not read_all:
         conditions.append(Document.owner_id == current_user_id)
