@@ -83,13 +83,18 @@ Protected routes require `Authorization: Bearer <token>`. Access depends on role
 | --- | --- | --- |
 | `POST` | `/auth/register` | Register with JSON body `email`, `password` |
 | `POST` | `/auth/token` | OAuth2 form: `username` = email, `password` |
+| `GET` | `/auth/me` | Current user profile (any authenticated user) |
 | `POST` | `/documents/upload` | Multipart upload (requires `documents:write`) |
 | `GET` | `/documents` | List documents (own only, or all if `manager`/`admin`) |
 | `GET` | `/documents/{id}` | Get metadata (own, or any if `manager`/`admin`) |
 | `POST` | `/documents/{id}/versions` | New version for **your** document only |
 | `GET` | `/documents/{id}/verify` | Content verification |
-| `GET` | `/admin/users` | List users (`admin` only) |
-| `PATCH` | `/admin/users/{id}/role` | Set user role (`admin` only), body `{"role":"viewer"}` |
+| `GET` | `/admin/users` | List users with pagination: `skip`, `limit` (default 100, max 500; `users:manage`) |
+| `GET` | `/admin/users/{id}` | Get one user (`users:manage`) |
+| `POST` | `/admin/users` | Create user: `email`, `password`, optional `role` (`users:manage`) |
+| `PATCH` | `/admin/users/{id}` | Partial update: any of `email`, `role`, `password` (`users:manage`) |
+| `PATCH` | `/admin/users/{id}/role` | Set role only (shortcut; `users:manage`) |
+| `DELETE` | `/admin/users/{id}` | Delete user if they own no documents; cannot delete self or the last admin (`users:manage`) |
 | `GET` | `/health` | Liveness check |
 
 The `content_sha256_hex` field in responses is the digest of **file bytes**, not the filename.

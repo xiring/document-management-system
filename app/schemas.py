@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.roles import normalize_role
 
@@ -26,6 +26,40 @@ class UserRoleUpdate(BaseModel):
     @classmethod
     def validate_role(cls, v: str) -> str:
         return normalize_role(v).value
+
+
+class AdminUserCreate(BaseModel):
+    """Create a user (admin-only)."""
+
+    email: EmailStr
+    password: str = Field(min_length=8)
+    role: str = Field(default="user", description="One of: admin, manager, user, viewer")
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        return normalize_role(v).value
+
+
+class AdminUserUpdate(BaseModel):
+    """Partial update: provide at least one field."""
+
+    email: EmailStr | None = None
+    role: str | None = None
+    password: str | None = Field(default=None, min_length=8)
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return normalize_role(v).value
+
+    @model_validator(mode="after")
+    def at_least_one_field(self) -> "AdminUserUpdate":
+        if self.email is None and self.role is None and self.password is None:
+            raise ValueError("Provide at least one of: email, role, password")
+        return self
 
 
 class Token(BaseModel):

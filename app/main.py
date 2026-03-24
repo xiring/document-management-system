@@ -4,7 +4,7 @@ from typing import Annotated
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 load_dotenv()
@@ -15,8 +15,17 @@ from app.database import Base, engine, ensure_users_role_column, get_db, promote
 from app.models import Document, User
 from app.blockchain_service import get_on_chain_owner, is_notarization_configured, notarize_hash
 from app.permissions import RequirePermission, can_access_document, has_permission
-from app.roles import Role
-from app.schemas import DocumentOut, DocumentVerifyResult, Token, UserCreate, UserOut, UserRoleUpdate
+from app.roles import Role, normalize_role
+from app.schemas import (
+    AdminUserCreate,
+    AdminUserUpdate,
+    DocumentOut,
+    DocumentVerifyResult,
+    Token,
+    UserCreate,
+    UserOut,
+    UserRoleUpdate,
+)
 from app.services.storage import read_stored_file, save_upload, sha256_bytes
 
 
@@ -70,6 +79,11 @@ def register(body: UserCreate, db: Annotated[Session, Depends(get_db)]) -> UserO
     db.commit()
     db.refresh(user)
     return UserOut.model_validate(user)
+
+
+@app.get("/auth/me", response_model=UserOut)
+def auth_me(current_user: Annotated[User, Depends(get_current_user)]) -> UserOut:
+    return UserOut.model_validate(current_user)
 
 
 @app.post("/auth/token", response_model=Token)
@@ -261,13 +275,131 @@ def verify_document(
     )
 
 
+def _count_users_with_role(db: Session, role: str) -> int:
+    return db.execute(select(func.count()).select_from(User).where(User.role == role)).scalar_one()
+
+
+def _count_documents_for_user(db: Session, user_id: int) -> int:
+    return db.execute(
+        select(func.count()).select_from(Document).where(Document.owner_id == user_id)
+    ).scalar_one()
+
+
+def _assert_can_change_admin_role(db: Session, target: User, new_role: str) -> None:
+    if target.role != Role.admin.value:
+        return
+    if normalize_role(new_role).value == Role.admin.value:
+        return
+    if _count_users_with_role(db, Role.admin.value) <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot demote the only admin; promote another admin first.",
+        )
+
+
+def _assert_can_remove_admin(db: Session, target: User) -> None:
+    if target.role != Role.admin.value:
+        return
+    if _count_users_with_role(db, Role.admin.value) <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete the only admin.",
+        )
+
+
 @app.get("/admin/users", response_model=list[UserOut])
 def admin_list_users(
     _: Annotated[User, Depends(RequirePermission("users:manage"))],
     db: Annotated[Session, Depends(get_db)],
+    skip: int = 0,
+    limit: int = 100,
 ) -> list[UserOut]:
-    rows = db.execute(select(User).order_by(User.id)).scalars().all()
+    limit = min(max(limit, 1), 500)
+    skip = max(skip, 0)
+    rows = (
+        db.execute(select(User).order_by(User.id).offset(skip).limit(limit)).scalars().all()
+    )
     return [UserOut.model_validate(u) for u in rows]
+
+
+@app.get("/admin/users/{user_id}", response_model=UserOut)
+def admin_get_user(
+    user_id: int,
+    _: Annotated[User, Depends(RequirePermission("users:manage"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> UserOut:
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return UserOut.model_validate(target)
+
+
+@app.post("/admin/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def admin_create_user(
+    body: AdminUserCreate,
+    _: Annotated[User, Depends(RequirePermission("users:manage"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> UserOut:
+    existing = db.execute(select(User).where(User.email == body.email)).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user = User(
+        email=body.email,
+        hashed_password=hash_password(body.password),
+        role=body.role,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return UserOut.model_validate(user)
+
+
+@app.patch("/admin/users/{user_id}", response_model=UserOut)
+def admin_update_user(
+    user_id: int,
+    body: AdminUserUpdate,
+    _: Annotated[User, Depends(RequirePermission("users:manage"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> UserOut:
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if body.role is not None:
+        _assert_can_change_admin_role(db, target, body.role)
+        target.role = body.role
+    if body.email is not None:
+        other = db.execute(
+            select(User).where(User.email == body.email, User.id != user_id)
+        ).scalar_one_or_none()
+        if other:
+            raise HTTPException(status_code=400, detail="Email already in use")
+        target.email = body.email
+    if body.password is not None:
+        target.hashed_password = hash_password(body.password)
+    db.commit()
+    db.refresh(target)
+    return UserOut.model_validate(target)
+
+
+@app.delete("/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def admin_delete_user(
+    user_id: int,
+    admin: Annotated[User, Depends(RequirePermission("users:manage"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> None:
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.id == admin.id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    if _count_documents_for_user(db, user_id) > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User still owns documents; delete or reassign documents first.",
+        )
+    _assert_can_remove_admin(db, target)
+    db.delete(target)
+    db.commit()
 
 
 @app.patch("/admin/users/{user_id}/role", response_model=UserOut)
@@ -280,6 +412,7 @@ def admin_set_user_role(
     target = db.get(User, user_id)
     if target is None:
         raise HTTPException(status_code=404, detail="User not found")
+    _assert_can_change_admin_role(db, target, body.role)
     target.role = body.role
     db.commit()
     db.refresh(target)
