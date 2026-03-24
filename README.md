@@ -35,13 +35,44 @@ A small **FastAPI** backend that stores document metadata in **PostgreSQL**, kee
    cp .env.example .env
    ```
 
-4. **Run the API** (tables are created on startup via SQLAlchemy):
+4. **Apply database migrations** (production path; uses [Alembic](https://alembic.sqlalchemy.org/)):
+
+   ```bash
+   alembic upgrade head
+   ```
+
+   For **local development** without Alembic, you can set `USE_SQLALCHEMY_CREATE_ALL=true` in `.env` so the app runs the legacy SQLAlchemy `create_all` + compatibility `ALTER`s on startup (not for production).
+
+5. Optional: set `RUN_MIGRATIONS_ON_STARTUP=true` to run `alembic upgrade head` when the process starts (use only if your orchestrator does not run migrations separately).
+
+6. **Run the API**:
 
    ```bash
    uvicorn app.main:app --reload
    ```
 
-5. Open **interactive docs**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+7. Open **interactive docs**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+### TypeScript API types
+
+With Node.js installed:
+
+```bash
+npm install
+npm run generate:api
+```
+
+This writes `openapi/openapi.json` and `openapi/ts/schema.d.ts` (from [openapi-typescript](https://github.com/openapi-ts/openapi-typescript)). Use the types with `fetch` or a client such as [openapi-fetch](https://github.com/openapi-ts/openapi-fetch).
+
+### Background jobs (Celery)
+
+Requires Redis (broker + result backend). Defaults: `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` → `redis://localhost:6379/0`.
+
+```bash
+celery -A app.celery_app worker -l info
+```
+
+Tasks include Merkle batch commits for pending deferred documents (`dms.merkle.commit_all_pending`), plus stubs for virus scanning and email. Schedule retries with cron or your scheduler calling the task names you need.
 
 ## Environment variables
 
@@ -57,6 +88,9 @@ See `.env.example` for the full list. Important fields:
 | `CONTRACT_ADDRESS` | Deployed `DocumentNotary` contract (optional) |
 | `CHAIN_ID` | Network chain ID (e.g. `1`, `137` for Polygon) |
 | `BOOTSTRAP_ADMIN_EMAIL` | Optional. **On registration**, this email gets `admin`. **On every startup**, if a user with this email exists and is not admin yet, they are promoted to `admin` (so you can fix access without SQL) |
+| `RUN_MIGRATIONS_ON_STARTUP` | If `true`, run `alembic upgrade head` on app startup (default `false`; prefer CI/CD migrations) |
+| `USE_SQLALCHEMY_CREATE_ALL` | If `true`, legacy dev bootstrap: `create_all` + ad-hoc `ALTER`s (default `true` for convenience; set `false` in production and use Alembic) |
+| `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` | Redis URLs for Celery workers |
 
 If `ETH_RPC_URL`, `CONTRACT_ADDRESS`, or `PRIVATE_KEY` is missing, uploads still work but **on-chain notarization is skipped** (`blockchain_tx_hash` may be null).
 
@@ -73,7 +107,7 @@ Each user has a `role` stored in PostgreSQL (`admin`, `manager`, `user`, or `vie
 
 New registrations default to `user`. Set `BOOTSTRAP_ADMIN_EMAIL` before the first admin registers, or promote users with `PATCH /admin/users/{id}/role` (admins only). After a role change, the user should request a new JWT (`POST /auth/token`) so clients reflect the new role (the API always loads the role from the database on each request).
 
-On startup, PostgreSQL databases that predate the `users.role` column get `ALTER TABLE ... ADD COLUMN IF NOT EXISTS role ...` applied automatically.
+If you still use `USE_SQLALCHEMY_CREATE_ALL=true`, legacy startup hooks may apply `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for older databases. Prefer Alembic migrations for schema changes.
 
 ## API overview
 
@@ -109,7 +143,8 @@ Protected routes require `Authorization: Bearer <token>`. Access depends on role
 | `PATCH` | `/admin/users/{id}/role` | Set role only (shortcut; `users:manage`) |
 | `DELETE` | `/admin/users/{id}` | Delete user if they own no **active** (non-deleted) documents; cannot delete self or the last admin (`users:manage`) |
 | `POST` | `/admin/retention/apply` | Soft-delete documents past `retention_expires_at` (skips `legal_hold`); returns `soft_deleted_count` (`users:manage`) |
-| `GET` | `/health` | Liveness check |
+| `GET` | `/health` | Liveness (`{ "status": "ok" }`) |
+| `GET` | `/health/ready` | Readiness: DB `SELECT 1` + optional `ETH_RPC_URL` probe; **503** if checks fail |
 
 The `content_sha256_hex` field in responses is the digest of **file bytes**, not the filename.
 

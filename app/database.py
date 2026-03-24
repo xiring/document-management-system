@@ -173,6 +173,18 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
+def run_alembic_upgrade_head() -> None:
+    """Apply Alembic migrations to ``head`` (uses ``DATABASE_URL`` from settings)."""
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(root / "alembic.ini"))
+    command.upgrade(cfg, "head")
+
+
 def promote_bootstrap_admin_if_configured() -> None:
     """
     If BOOTSTRAP_ADMIN_EMAIL matches an existing user, set their role to admin.

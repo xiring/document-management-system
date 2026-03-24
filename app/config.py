@@ -5,6 +5,14 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/dms"
+    # Production: run ``alembic upgrade head`` in CI/CD, or set ``run_migrations_on_startup`` true.
+    run_migrations_on_startup: bool = False
+    # Legacy dev path: create tables with SQLAlchemy + ad-hoc ALTER helpers (disable in production; use Alembic).
+    use_sqlalchemy_create_all: bool = True
+
+    # Celery (background jobs). Defaults suit local Redis; disable workers by not running them.
+    celery_broker_url: str = "redis://localhost:6379/0"
+    celery_result_backend: str = "redis://localhost:6379/0"
     jwt_secret_key: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24

@@ -8,14 +8,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.activity_log import ActivityAction, log_activity
-from app.blockchain_service import commit_merkle_root_ctx, is_merkle_batch_configured_for_context
-from app.chain_resolution import chain_context_from_db
 from app.database import get_db
-from app.merkle import merkle_root as build_merkle_root
-from app.models import ChainConfig, Document, MerkleBatch, User
+from app.models import ChainConfig, Document, User
 from app.permissions import RequirePermission
 from app.schemas import ChainConfigCreate, ChainConfigOut, ChainConfigUpdate, MerkleCommitOut
+from app.services.merkle_batch import commit_merkle_batch_for_config
 
 router = APIRouter(prefix="/chain-configs", tags=["Chain configs"])
 
@@ -107,66 +104,20 @@ def commit_merkle_batch(
     db: Annotated[Session, Depends(get_db)],
     max_documents: int = Query(default=500, ge=1, le=5000),
 ) -> MerkleCommitOut:
-    cc = _get_owned_config(db, config_id, current_user.id)
-    ctx = chain_context_from_db(cc)
-    if not is_merkle_batch_configured_for_context(ctx):
-        raise HTTPException(
-            status_code=400,
-            detail="Batch contract not configured for this chain (set batch_contract_address and PRIVATE_KEY).",
+    _get_owned_config(db, config_id, current_user.id)
+    try:
+        out = commit_merkle_batch_for_config(
+            db,
+            chain_config_id=config_id,
+            max_documents=max_documents,
+            owner_id=current_user.id,
+            actor_user_id=current_user.id,
         )
-    docs = (
-        db.execute(
-            select(Document)
-            .where(
-                Document.chain_config_id == config_id,
-                Document.owner_id == current_user.id,
-                Document.pending_merkle.is_(True),
-                Document.merkle_batch_id.is_(None),
-                Document.deleted_at.is_(None),
-            )
-            .limit(max_documents)
-        )
-        .scalars()
-        .all()
-    )
-    if not docs:
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    if out is None:
         raise HTTPException(status_code=400, detail="No pending documents to batch for this chain config.")
-    leaves = [d.file_hash for d in docs]
-    root = build_merkle_root(leaves)
-    tx = commit_merkle_root_ctx(ctx, root)
-    if not tx:
-        raise HTTPException(
-            status_code=502,
-            detail="Failed to submit Merkle root transaction (RPC or signing error).",
-        )
-    batch = MerkleBatch(
-        chain_config_id=cc.id,
-        merkle_root=root,
-        tx_hash=tx,
-        leaf_count=len(docs),
-    )
-    db.add(batch)
-    db.flush()
-    for d in docs:
-        d.merkle_batch_id = batch.id
-        d.pending_merkle = False
-    log_activity(
-        db,
-        actor_user_id=current_user.id,
-        action=ActivityAction.MERKLE_BATCH_COMMITTED,
-        payload={
-            "batch_id": batch.id,
-            "leaf_count": len(docs),
-            "merkle_root_hex": root.hex(),
-            "tx_hash": tx,
-            "chain_config_id": cc.id,
-        },
-    )
     db.commit()
-    db.refresh(batch)
-    return MerkleCommitOut(
-        batch_id=batch.id,
-        merkle_root_hex=root.hex(),
-        tx_hash=tx,
-        leaf_count=len(docs),
-    )
+    return out

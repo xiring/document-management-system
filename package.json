@@ -1,0 +1,10 @@
+{
+  "name": "dms",
+  "private": true,
+  "scripts": {
+    "generate:api": "bash scripts/generate-openapi-ts.sh"
+  },
+  "devDependencies": {
+    "openapi-typescript": "^7.4.4"
+  }
+}

@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, selectinload
@@ -25,7 +26,9 @@ from app.database import (
     ensure_users_role_column,
     get_db,
     promote_bootstrap_admin_if_configured,
+    run_alembic_upgrade_head,
 )
+from app.health import aggregate_readiness
 from app.document_search import build_document_list_filters, document_count_query, document_list_query
 from app.models import ActivityEvent, ChainConfig, Collection, Document, DocumentPermission, Folder, Tag, User
 from app.blockchain_service import notarize_hash, notarize_hash_ctx
@@ -140,14 +143,17 @@ def _apply_notarization(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    ensure_users_role_column()
-    ensure_organization_columns()
-    ensure_document_retention_columns()
-    ensure_document_lifecycle_column()
-    ensure_document_chain_columns()
-    ensure_folder_tree_schema()
-    ensure_pg_trgm()
+    if settings.run_migrations_on_startup:
+        run_alembic_upgrade_head()
+    elif settings.use_sqlalchemy_create_all:
+        Base.metadata.create_all(bind=engine)
+        ensure_users_role_column()
+        ensure_organization_columns()
+        ensure_document_retention_columns()
+        ensure_document_lifecycle_column()
+        ensure_document_chain_columns()
+        ensure_folder_tree_schema()
+        ensure_pg_trgm()
     promote_bootstrap_admin_if_configured()
     yield
 
@@ -161,7 +167,10 @@ app = FastAPI(
         {"name": "Activity", "description": "Audit and activity feeds."},
         {"name": "Public", "description": "Unauthenticated endpoints (e.g. token-based verify)."},
         {"name": "Admin", "description": "User management and retention jobs (requires admin permissions)."},
-        {"name": "Health", "description": "Liveness and readiness."},
+        {
+            "name": "Health",
+            "description": "Liveness (`GET /health`) and readiness with DB + RPC (`GET /health/ready`).",
+        },
         {"name": "Collaboration", "description": "ACL, share links, lifecycle workflow, and shared read/verify."},
         {"name": "Folders", "description": "Folder tree for organizing documents."},
         {"name": "Tags", "description": "Tags for documents."},
@@ -1009,5 +1018,19 @@ def admin_set_user_role(
 
 
 @app.get("/health", tags=["Health"])
-def health() -> dict[str, str]:
+def health_liveness() -> dict[str, str]:
+    """Process is up (Kubernetes liveness)."""
     return {"status": "ok"}
+
+
+@app.get("/health/ready", tags=["Health"])
+def health_readiness(db: Annotated[Session, Depends(get_db)]) -> dict:
+    """Database connectivity and optional ``ETH_RPC_URL`` JSON-RPC probe (readiness)."""
+    overall, checks = aggregate_readiness(db)
+    code = status.HTTP_200_OK
+    if overall != "ok":
+        code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return JSONResponse(
+        status_code=code,
+        content={"status": overall, "checks": checks},
+    )
