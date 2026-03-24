@@ -52,6 +52,7 @@ class User(Base):
     folders: Mapped[list["Folder"]] = relationship("Folder", back_populates="owner")
     tags: Mapped[list["Tag"]] = relationship("Tag", back_populates="owner")
     collections: Mapped[list["Collection"]] = relationship("Collection", back_populates="owner")
+    chain_configs: Mapped[list["ChainConfig"]] = relationship("ChainConfig", back_populates="owner")
 
 
 class Folder(Base):
@@ -109,6 +110,40 @@ class Collection(Base):
     )
 
 
+class ChainConfig(Base):
+    """Per-tenant (owner) chain endpoints: RPC + contracts for document and batch notarization."""
+
+    __tablename__ = "chain_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    rpc_url: Mapped[str] = mapped_column(Text, nullable=False)
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    document_contract_address: Mapped[str] = mapped_column(String(42), nullable=False)
+    batch_contract_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    owner: Mapped["User"] = relationship("User", back_populates="chain_configs")
+    batches: Mapped[list["MerkleBatch"]] = relationship("MerkleBatch", back_populates="chain_config")
+
+
+class MerkleBatch(Base):
+    """Committed Merkle root (many document hashes in one tx)."""
+
+    __tablename__ = "merkle_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chain_config_id: Mapped[int] = mapped_column(ForeignKey("chain_configs.id"), nullable=False, index=True)
+    merkle_root: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    tx_hash: Mapped[str] = mapped_column(String(66), nullable=False)
+    leaf_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    chain_config: Mapped["ChainConfig"] = relationship("ChainConfig", back_populates="batches")
+    documents: Mapped[list["Document"]] = relationship("Document", back_populates="merkle_batch")
+
+
 class Document(Base):
     __tablename__ = "documents"
 
@@ -116,6 +151,14 @@ class Document(Base):
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     folder_id: Mapped[int | None] = mapped_column(ForeignKey("folders.id"), nullable=True, index=True)
+    chain_config_id: Mapped[int | None] = mapped_column(ForeignKey("chain_configs.id"), nullable=True, index=True)
+    merkle_batch_id: Mapped[int | None] = mapped_column(ForeignKey("merkle_batches.id"), nullable=True, index=True)
+    pending_merkle: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        default=False,
+    )
     upload_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     storage_uri: Mapped[str] = mapped_column(Text, nullable=False)
     file_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
@@ -136,6 +179,8 @@ class Document(Base):
     )
 
     owner: Mapped["User"] = relationship("User", back_populates="documents")
+    chain_config: Mapped["ChainConfig | None"] = relationship("ChainConfig")
+    merkle_batch: Mapped["MerkleBatch | None"] = relationship("MerkleBatch")
     folder: Mapped["Folder | None"] = relationship("Folder", back_populates="documents")
     tags: Mapped[list["Tag"]] = relationship("Tag", secondary=document_tags, back_populates="documents")
     collections: Mapped[list["Collection"]] = relationship(

@@ -90,6 +90,36 @@ def ensure_organization_columns() -> None:
         )
 
 
+def ensure_document_chain_columns() -> None:
+    """FK columns on documents for per-tenant chain config and Merkle batch (PostgreSQL)."""
+    if not settings.database_url.startswith("postgresql"):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS chain_config_id INTEGER "
+                    "REFERENCES chain_configs(id)"
+                )
+            )
+            conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS merkle_batch_id INTEGER "
+                    "REFERENCES merkle_batches(id)"
+                )
+            )
+            conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS pending_merkle BOOLEAN NOT NULL DEFAULT false"
+                )
+            )
+    except Exception as e:
+        logger.warning(
+            "Document chain / Merkle columns could not be applied (run migrations or create tables). Error: %s",
+            e,
+        )
+
+
 def ensure_pg_trgm() -> None:
     """Enable pg_trgm for filename similarity search; add GIN index on documents.filename."""
     if not settings.database_url.startswith("postgresql"):

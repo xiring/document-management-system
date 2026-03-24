@@ -29,6 +29,8 @@ class ActivityAction:
 
     RETENTION_APPLIED = "retention.applied"
 
+    MERKLE_BATCH_COMMITTED = "merkle.batch_committed"
+
 
 def log_activity(
     db: Session,

@@ -153,6 +153,9 @@ class DocumentOut(BaseModel):
     filename: str
     owner_id: int
     folder_id: int | None = None
+    chain_config_id: int | None = None
+    merkle_batch_id: int | None = None
+    pending_merkle: bool = False
     tag_ids: list[int] = Field(default_factory=list)
     collection_ids: list[int] = Field(default_factory=list)
     upload_date: datetime
@@ -246,3 +249,57 @@ class DocumentVerifyResult(BaseModel):
     is_latest_version: bool
     newer_version_document_id: int | None
     message: str
+    chain_id: int | None = Field(
+        default=None,
+        description="Resolved chain id from global settings or ChainConfig.",
+    )
+    merkle_batch_id: int | None = None
+    merkle_root_hex: str | None = None
+    merkle_root_on_chain: bool | None = None
+    merkle_proof_valid: bool | None = None
+
+
+class ChainConfigOut(BaseModel):
+    id: int
+    owner_id: int
+    name: str
+    rpc_url: str
+    chain_id: int
+    document_contract_address: str
+    batch_contract_address: str | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ChainConfigCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    rpc_url: str = Field(min_length=1)
+    chain_id: int
+    document_contract_address: str = Field(min_length=42, max_length=42)
+    batch_contract_address: str | None = Field(default=None, max_length=42)
+
+
+class ChainConfigUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    rpc_url: str | None = None
+    chain_id: int | None = None
+    document_contract_address: str | None = Field(default=None, min_length=42, max_length=42)
+    batch_contract_address: str | None = Field(default=None, max_length=42)
+
+
+class MerkleCommitOut(BaseModel):
+    batch_id: int
+    merkle_root_hex: str
+    tx_hash: str
+    leaf_count: int
+
+
+class PublicVerifyLinkOut(BaseModel):
+    token: str
+    expires_in_hours: int
+    verify_path: str = Field(description="Relative path, e.g. /public/verify?t=...")
+
+
+class PublicVerifyLinkCreate(BaseModel):
+    expires_in_hours: int | None = Field(default=None, ge=1, le=8760)

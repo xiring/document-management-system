@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     private_key: str = ""
     contract_address: str = ""
     chain_id: int = 1
+    # Optional: global BatchNotary.sol for periodic Merkle roots (same RPC/chain as above).
+    batch_contract_address: str = ""  # env: BATCH_CONTRACT_ADDRESS
+
+    # Public share links for verify (defaults to JWT secret if empty — set in production)
+    public_verify_secret: str = ""
+    public_verify_token_hours: int = 168
 
     # If set, the first registration with this email (case-insensitive) gets `admin` role.
     bootstrap_admin_email: str = ""

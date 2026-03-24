@@ -16,6 +16,7 @@ from app.config import settings
 from app.database import (
     Base,
     engine,
+    ensure_document_chain_columns,
     ensure_folder_tree_schema,
     ensure_document_retention_columns,
     ensure_organization_columns,
@@ -25,8 +26,10 @@ from app.database import (
     promote_bootstrap_admin_if_configured,
 )
 from app.document_search import build_document_list_filters, document_count_query, document_list_query
-from app.models import ActivityEvent, Collection, Document, Folder, Tag, User
-from app.blockchain_service import get_on_chain_owner, is_notarization_configured, notarize_hash
+from app.models import ActivityEvent, ChainConfig, Collection, Document, Folder, Tag, User
+from app.blockchain_service import notarize_hash, notarize_hash_ctx
+from app.chain_resolution import chain_context_from_db
+from app.public_verify import create_public_verify_token, decode_public_verify_token
 from app.permissions import RequirePermission, can_access_document, has_permission
 from app.roles import Role, normalize_role
 from app.schemas import (
@@ -38,14 +41,18 @@ from app.schemas import (
     DocumentMetadataUpdate,
     DocumentOut,
     DocumentVerifyResult,
+    PublicVerifyLinkCreate,
+    PublicVerifyLinkOut,
     RetentionApplyOut,
     Token,
     UserCreate,
     UserOut,
     UserRoleUpdate,
 )
+from app.routers.chain import router as chain_router
 from app.routers.organization import collection_router, folder_router, tag_router
-from app.services.storage import read_stored_file, save_upload, sha256_bytes
+from app.verify_logic import run_document_verify
+from app.services.storage import save_upload
 
 
 def _activity_rows_to_out(db: Session, rows: list[ActivityEvent]) -> list[ActivityEventOut]:
@@ -98,6 +105,9 @@ def document_to_out(doc: Document) -> DocumentOut:
         deleted_at=doc.deleted_at,
         legal_hold=bool(doc.legal_hold),
         retention_expires_at=doc.retention_expires_at,
+        chain_config_id=doc.chain_config_id,
+        merkle_batch_id=doc.merkle_batch_id,
+        pending_merkle=bool(doc.pending_merkle),
     )
 
 
@@ -110,12 +120,54 @@ def _resolve_folder_for_owner(db: Session, folder_id: int | None, owner_id: int)
     return folder_id
 
 
+def _apply_notarization(
+    db: Session,
+    doc: Document,
+    digest: bytes,
+    *,
+    chain_config_id: int | None,
+    defer_notarization: bool,
+    owner_id: int,
+) -> None:
+    cc: ChainConfig | None = None
+    if chain_config_id is not None:
+        cc = db.get(ChainConfig, chain_config_id)
+        if cc is None or cc.owner_id != owner_id:
+            raise HTTPException(status_code=404, detail="Chain config not found")
+        doc.chain_config_id = cc.id
+    if defer_notarization:
+        if doc.chain_config_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="defer_notarization requires chain_config_id with a batch contract",
+            )
+        cc2 = db.get(ChainConfig, doc.chain_config_id)
+        if cc2 is None or not (cc2.batch_contract_address or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Chain config must have batch_contract_address for deferred Merkle notarization",
+            )
+        doc.pending_merkle = True
+        doc.blockchain_tx_hash = None
+        return
+    doc.pending_merkle = False
+    if doc.chain_config_id is not None:
+        cc = db.get(ChainConfig, doc.chain_config_id)
+        if cc is None:
+            doc.blockchain_tx_hash = None
+            return
+        doc.blockchain_tx_hash = notarize_hash_ctx(chain_context_from_db(cc), digest)
+    else:
+        doc.blockchain_tx_hash = notarize_hash(digest)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     ensure_users_role_column()
     ensure_organization_columns()
     ensure_document_retention_columns()
+    ensure_document_chain_columns()
     ensure_folder_tree_schema()
     ensure_pg_trgm()
     promote_bootstrap_admin_if_configured()
@@ -126,6 +178,7 @@ app = FastAPI(title="DMS", lifespan=lifespan)
 app.include_router(folder_router)
 app.include_router(tag_router)
 app.include_router(collection_router)
+app.include_router(chain_router)
 
 
 def _initial_role_for_email(email: str) -> str:
@@ -183,13 +236,14 @@ async def upload_document(
     db: Annotated[Session, Depends(get_db)],
     file: UploadFile = File(...),
     folder_id: int | None = Form(default=None),
+    chain_config_id: int | None = Form(default=None),
+    defer_notarization: bool = Form(default=False),
 ) -> DocumentOut:
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
     fid = _resolve_folder_for_owner(db, folder_id, current_user.id)
     storage_uri, digest = save_upload(content, file.filename or "unnamed")
-    tx_hash = notarize_hash(digest)
     retention: datetime | None = None
     if settings.default_retention_days is not None and settings.default_retention_days > 0:
         retention = datetime.now(timezone.utc) + timedelta(days=settings.default_retention_days)
@@ -199,13 +253,21 @@ async def upload_document(
         folder_id=fid,
         storage_uri=storage_uri,
         file_hash=digest,
-        blockchain_tx_hash=tx_hash,
+        blockchain_tx_hash=None,
         version=1,
         previous_version_id=None,
         retention_expires_at=retention,
     )
     db.add(doc)
     db.flush()
+    _apply_notarization(
+        db,
+        doc,
+        digest,
+        chain_config_id=chain_config_id,
+        defer_notarization=defer_notarization,
+        owner_id=current_user.id,
+    )
     log_activity(
         db,
         actor_user_id=current_user.id,
@@ -573,6 +635,8 @@ async def upload_new_version(
     current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
     db: Annotated[Session, Depends(get_db)],
     file: UploadFile = File(...),
+    chain_config_id: int | None = Form(default=None),
+    defer_notarization: bool = Form(default=False),
 ) -> DocumentOut:
     parent = db.execute(
         select(Document)
@@ -590,14 +654,15 @@ async def upload_new_version(
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
     storage_uri, digest = save_upload(content, file.filename or parent.filename)
-    tx_hash = notarize_hash(digest)
+    cid = chain_config_id if chain_config_id is not None else parent.chain_config_id
     new_doc = Document(
         filename=file.filename or parent.filename,
         owner_id=current_user.id,
         folder_id=parent.folder_id,
+        chain_config_id=cid,
         storage_uri=storage_uri,
         file_hash=digest,
-        blockchain_tx_hash=tx_hash,
+        blockchain_tx_hash=None,
         version=parent.version + 1,
         previous_version_id=parent.id,
         legal_hold=parent.legal_hold,
@@ -605,6 +670,14 @@ async def upload_new_version(
     )
     db.add(new_doc)
     db.flush()
+    _apply_notarization(
+        db,
+        new_doc,
+        digest,
+        chain_config_id=cid,
+        defer_notarization=defer_notarization,
+        owner_id=current_user.id,
+    )
     new_doc.tags = list(parent.tags)
     new_doc.collections = list(parent.collections)
     log_activity(
@@ -623,15 +696,6 @@ async def upload_new_version(
     return document_to_out(new_doc)
 
 
-def _newer_version_document_id(db: Session, doc: Document) -> int | None:
-    return db.execute(
-        select(Document.id).where(
-            Document.previous_version_id == doc.id,
-            Document.owner_id == doc.owner_id,
-        ).limit(1)
-    ).scalar_one_or_none()
-
-
 @app.get("/documents/{document_id}/verify", response_model=DocumentVerifyResult)
 def verify_document(
     document_id: int,
@@ -647,99 +711,40 @@ def verify_document(
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at is not None and not include_deleted:
         raise HTTPException(status_code=404, detail="Document not found")
+    return run_document_verify(db, doc, actor_user_id=current_user.id, log_activity_events=True)
 
-    successor_id = _newer_version_document_id(db, doc)
-    is_latest = successor_id is None
-    configured = is_notarization_configured()
 
+@app.post("/documents/{document_id}/verify-link", response_model=PublicVerifyLinkOut)
+def create_public_verify_link(
+    document_id: int,
+    body: PublicVerifyLinkCreate,
+    current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> PublicVerifyLinkOut:
+    doc = db.get(Document, document_id)
+    if doc is None or doc.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    token, hours = create_public_verify_token(document_id, body.expires_in_hours)
+    return PublicVerifyLinkOut(
+        token=token,
+        expires_in_hours=hours,
+        verify_path=f"/public/verify?t={token}",
+    )
+
+
+@app.get("/public/verify", response_model=DocumentVerifyResult)
+def public_verify_document(
+    db: Annotated[Session, Depends(get_db)],
+    t: str = Query(..., description="JWT from POST /documents/{id}/verify-link"),
+) -> DocumentVerifyResult:
     try:
-        raw = read_stored_file(doc.storage_uri)
-    except FileNotFoundError:
-        stored_hex = doc.file_hash.hex() if isinstance(doc.file_hash, (bytes, bytearray)) else None
-        log_activity(
-            db,
-            actor_user_id=current_user.id,
-            action=ActivityAction.DOCUMENT_VERIFY,
-            document_id=doc.id,
-            payload={"outcome": "missing_file"},
-        )
-        db.commit()
-        return DocumentVerifyResult(
-            document_id=doc.id,
-            content_matches_stored_hash=False,
-            content_hash_matches_blockchain=None,
-            stored_content_sha256_hex=stored_hex,
-            computed_content_sha256_hex=None,
-            notarization_configured=configured,
-            is_latest_version=is_latest,
-            newer_version_document_id=successor_id,
-            message="Stored file missing; cannot recompute content hash from disk.",
-        )
-
-    current_hash = sha256_bytes(raw)
-    stored_hex = doc.file_hash.hex() if isinstance(doc.file_hash, (bytes, bytearray)) else ""
-    computed_hex = current_hash.hex()
-    matches_record = current_hash == doc.file_hash
-    chain_owner = get_on_chain_owner(doc.file_hash)
-
-    parts: list[str] = []
-    if matches_record:
-        parts.append("SHA-256 of file bytes on disk matches the content hash stored at upload.")
-    else:
-        parts.append("SHA-256 of file bytes on disk does not match stored content hash (file was altered).")
-
-    if successor_id is not None:
-        parts.append(
-            f"This row is not the latest version — verify document_id={successor_id} for the newest upload."
-        )
-
-    if not configured:
-        matches_chain = None
-        parts.append(
-            "On-chain proof is unavailable: set ETH_RPC_URL, CONTRACT_ADDRESS, and PRIVATE_KEY, deploy DocumentNotary.sol, and restart."
-        )
-    elif doc.blockchain_tx_hash is None:
-        matches_chain = None
-        parts.append(
-            "No notarization transaction was stored for this upload (notarization was skipped or failed at upload time)."
-        )
-    elif chain_owner is None:
-        matches_chain = False
-        parts.append(
-            "Could not find this hash on-chain (wrong network, contract address, or RPC)."
-        )
-    else:
-        matches_chain = matches_record
-        if matches_record:
-            parts.append("The stored hash is registered on-chain.")
-        else:
-            parts.append("The file no longer matches the hash that was notarized on-chain.")
-
-    log_activity(
-        db,
-        actor_user_id=current_user.id,
-        action=ActivityAction.DOCUMENT_VERIFY,
-        document_id=doc.id,
-        payload={
-            "outcome": "ok",
-            "content_matches_stored_hash": matches_record,
-            "content_hash_matches_blockchain": matches_chain,
-            "is_latest_version": is_latest,
-            "newer_version_document_id": successor_id,
-        },
-    )
-    db.commit()
-    return DocumentVerifyResult(
-        document_id=doc.id,
-        content_matches_stored_hash=matches_record,
-        content_hash_matches_blockchain=matches_chain,
-        stored_content_sha256_hex=stored_hex,
-        computed_content_sha256_hex=computed_hex,
-        notarization_configured=configured,
-        is_latest_version=is_latest,
-        newer_version_document_id=successor_id,
-        message=" ".join(parts),
-    )
+        doc_id = decode_public_verify_token(t)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
+    doc = db.get(Document, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return run_document_verify(db, doc, actor_user_id=None, log_activity_events=True)
 
 
 def _count_users_with_role(db: Session, role: str) -> int:

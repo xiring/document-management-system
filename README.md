@@ -84,7 +84,7 @@ Protected routes require `Authorization: Bearer <token>`. Access depends on role
 | `POST` | `/auth/register` | Register with JSON body `email`, `password` |
 | `POST` | `/auth/token` | OAuth2 form: `username` = email, `password` |
 | `GET` | `/auth/me` | Current user profile (any authenticated user) |
-| `POST` | `/documents/upload` | Multipart upload + optional form field `folder_id` (`documents:write`) |
+| `POST` | `/documents/upload` | Multipart: `file`, optional `folder_id`, `chain_config_id`, `defer_notarization` (queue for Merkle batch; requires chain config with batch contract) (`documents:write`) |
 | `PATCH` | `/documents/{id}` | Metadata: `folder_id`, `tag_ids`, `collection_ids`, `legal_hold`, `retention_expires_at` (partial JSON; `documents:write`, owner only; 409 if soft-deleted) |
 | `DELETE` | `/documents/{id}` | Soft-delete: sets `deleted_at` (409 if `legal_hold` or already deleted; `documents:write`, owner only) |
 | `POST` | `/documents/{id}/restore` | Clear `deleted_at` (`documents:write`, owner only; 409 if not deleted) |
@@ -96,8 +96,12 @@ Protected routes require `Authorization: Bearer <token>`. Access depends on role
 | `GET` | `/documents/{id}` | Get metadata; query `include_deleted` to read trashed rows (own, or any if `manager`/`admin`) |
 | `GET` | `/activity` | Audit / activity feed: `{ items, total, skip, limit }`. Optional `document_id`, `action` (`documents:read`) |
 | `GET` | `/documents/{id}/activity` | Same feed scoped to one document; optional `include_deleted` for trashed docs (`documents:read`) |
-| `POST` | `/documents/{id}/versions` | New version for **your** document only (409 if parent is soft-deleted) |
-| `GET` | `/documents/{id}/verify` | Content verification; query `include_deleted` to verify a trashed row |
+| `POST` | `/documents/{id}/versions` | Same form options as upload; optional `chain_config_id` (defaults to parent’s) (`documents:write`) |
+| `GET` | `/documents/{id}/verify` | Content + chain verification (per-doc notary or Merkle batch); query `include_deleted` |
+| `POST` | `/documents/{id}/verify-link` | JSON optional `expires_in_hours` — returns JWT + `verify_path` for **public** verify (`documents:write`, owner only) |
+| `GET` | `/public/verify?t=...` | No auth — verify using token from `verify-link` |
+| `GET`–`POST`–`PATCH`–`DELETE` | `/chain-configs`, `/chain-configs/{id}` | Per-user RPC + `document_contract_address` + optional `batch_contract_address` (multi-chain “tenant” configs) |
+| `POST` | `/chain-configs/{id}/merkle/commit` | Batch pending deferred docs into one Merkle root tx (`documents:write`, owner only); query `max_documents` |
 | `GET` | `/admin/users` | List users with pagination: `skip`, `limit` (default 100, max 500; `users:manage`) |
 | `GET` | `/admin/users/{id}` | Get one user (`users:manage`) |
 | `POST` | `/admin/users` | Create user: `email`, `password`, optional `role` (`users:manage`) |
@@ -115,7 +119,14 @@ The `content_sha256_hex` field in responses is the digest of **file bytes**, not
 - **Tags** — `GET/POST /tags`, `DELETE /tags/{id}`. Labels per user; attach via `PATCH /documents/{id}` with `tag_ids` (replaces the set). `POST /tags` returns existing tag if the name already exists.
 - **Collections** — named groups: `GET/POST /collections`, `GET/PATCH/DELETE /collections/{id}`, and `POST/DELETE /collections/{id}/documents/{document_id}` to add/remove a document. `PATCH /documents/{id}` with `collection_ids` replaces membership in all listed collections (omit field to leave unchanged).
 
-`DocumentOut` includes `folder_id`, `tag_ids`, `collection_ids`, `deleted_at`, `legal_hold`, and `retention_expires_at`. New document versions inherit folder, tags, collections, `legal_hold`, and `retention_expires_at` from the parent row.
+`DocumentOut` includes `folder_id`, `tag_ids`, `collection_ids`, `chain_config_id`, `merkle_batch_id`, `pending_merkle`, `deleted_at`, `legal_hold`, and `retention_expires_at`. New document versions inherit folder, tags, collections, `legal_hold`, `retention_expires_at`, and (unless overridden) the parent’s `chain_config_id`.
+
+### Chain configs, Merkle batch, and public verify
+
+- **Global defaults** — `ETH_RPC_URL`, `CONTRACT_ADDRESS`, `CHAIN_ID`, `PRIVATE_KEY` apply when a document has no `chain_config_id`. Optional **`BATCH_CONTRACT_ADDRESS`** deploys `contracts/BatchNotary.sol` on the same chain for **global** periodic roots (not yet wired to a cron endpoint; use per-config commit below).
+- **Per-user chain configs** — `POST /chain-configs` stores RPC URL, chain id, DocumentNotary address, and optional BatchNotary address. Upload/version with `chain_config_id` + `defer_notarization=true` queues the hash for a Merkle batch (no per-file tx). **`POST /chain-configs/{id}/merkle/commit`** builds a sorted Merkle tree over pending documents, calls `commitRoot(bytes32)` on the batch contract, and links rows via `merkle_batch_id`.
+- **Verify** — `GET /documents/{id}/verify` resolves the document’s chain (config or global), checks disk hash, then either Merkle proof + on-chain root **or** per-document `documentOwner` on the notary contract. Response includes optional `merkle_*` fields when applicable.
+- **Public link** — `POST /documents/{id}/verify-link` returns a JWT; **`GET /public/verify?t=`** runs the same verification **without** a logged-in user (set **`PUBLIC_VERIFY_SECRET`** for a dedicated signing key).
 
 ### Activity / audit feed
 
@@ -145,6 +156,10 @@ The `content_sha256_hex` field in responses is the digest of **file bytes**, not
 app/
   main.py              # FastAPI routes
   activity_log.py      # Audit event helpers and visibility filters
+  chain_resolution.py  # Global vs ChainConfig RPC/contracts
+  merkle.py            # Merkle root + proofs (batch notarization)
+  verify_logic.py      # Shared verify (auth + public)
+  public_verify.py     # JWT for /public/verify
   database.py          # Engine and sessions
   models.py            # SQLAlchemy models
   schemas.py           # Pydantic models
@@ -160,6 +175,7 @@ app/
     storage.py         # Local file IO and hashing
 contracts/
   DocumentNotary.sol
+  BatchNotary.sol
 .env.example
 requirements.txt
 ```
