@@ -90,6 +90,25 @@ def ensure_organization_columns() -> None:
         )
 
 
+def ensure_document_lifecycle_column() -> None:
+    """Workflow state on documents (PostgreSQL)."""
+    if not settings.database_url.startswith("postgresql"):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS lifecycle_state VARCHAR(32) "
+                    "NOT NULL DEFAULT 'published'"
+                )
+            )
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_documents_lifecycle_state ON documents (lifecycle_state)")
+            )
+    except Exception as e:
+        logger.warning("Document lifecycle_state column could not be applied. Error: %s", e)
+
+
 def ensure_document_chain_columns() -> None:
     """FK columns on documents for per-tenant chain config and Merkle batch (PostgreSQL)."""
     if not settings.database_url.startswith("postgresql"):

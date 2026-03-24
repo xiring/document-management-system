@@ -53,6 +53,9 @@ class User(Base):
     tags: Mapped[list["Tag"]] = relationship("Tag", back_populates="owner")
     collections: Mapped[list["Collection"]] = relationship("Collection", back_populates="owner")
     chain_configs: Mapped[list["ChainConfig"]] = relationship("ChainConfig", back_populates="owner")
+    document_permissions: Mapped[list["DocumentPermission"]] = relationship(
+        "DocumentPermission", back_populates="user"
+    )
 
 
 class Folder(Base):
@@ -144,12 +147,50 @@ class MerkleBatch(Base):
     documents: Mapped[list["Document"]] = relationship("Document", back_populates="merkle_batch")
 
 
+class DocumentPermission(Base):
+    """Explicit ACL: which user can read / write / verify / approve on a document."""
+
+    __tablename__ = "document_permissions"
+    __table_args__ = (UniqueConstraint("document_id", "user_id", name="uq_document_permission_user"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    permission: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    document: Mapped["Document"] = relationship("Document", back_populates="permissions")
+    user: Mapped["User"] = relationship("User", back_populates="document_permissions")
+
+
+class DocumentShareLink(Base):
+    """Opaque token link to a document with expiry (read or verify scope)."""
+
+    __tablename__ = "document_share_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    token: Mapped[str] = mapped_column(String(96), unique=True, nullable=False, index=True)
+    permission: Mapped[str] = mapped_column(String(16), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    document: Mapped["Document"] = relationship("Document", back_populates="share_links")
+
+
 class Document(Base):
     __tablename__ = "documents"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    lifecycle_state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text("'published'"),
+        default="published",
+        index=True,
+    )
     folder_id: Mapped[int | None] = mapped_column(ForeignKey("folders.id"), nullable=True, index=True)
     chain_config_id: Mapped[int | None] = mapped_column(ForeignKey("chain_configs.id"), nullable=True, index=True)
     merkle_batch_id: Mapped[int | None] = mapped_column(ForeignKey("merkle_batches.id"), nullable=True, index=True)
@@ -188,6 +229,16 @@ class Document(Base):
     )
     previous_version: Mapped["Document | None"] = relationship(
         "Document", remote_side="Document.id", foreign_keys=[previous_version_id]
+    )
+    permissions: Mapped[list["DocumentPermission"]] = relationship(
+        "DocumentPermission",
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
+    share_links: Mapped[list["DocumentShareLink"]] = relationship(
+        "DocumentShareLink",
+        back_populates="document",
+        cascade="all, delete-orphan",
     )
 
 

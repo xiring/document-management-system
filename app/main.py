@@ -17,6 +17,7 @@ from app.database import (
     Base,
     engine,
     ensure_document_chain_columns,
+    ensure_document_lifecycle_column,
     ensure_folder_tree_schema,
     ensure_document_retention_columns,
     ensure_organization_columns,
@@ -26,11 +27,13 @@ from app.database import (
     promote_bootstrap_admin_if_configured,
 )
 from app.document_search import build_document_list_filters, document_count_query, document_list_query
-from app.models import ActivityEvent, ChainConfig, Collection, Document, Folder, Tag, User
+from app.models import ActivityEvent, ChainConfig, Collection, Document, DocumentPermission, Folder, Tag, User
 from app.blockchain_service import notarize_hash, notarize_hash_ctx
 from app.chain_resolution import chain_context_from_db
 from app.public_verify import create_public_verify_token, decode_public_verify_token
-from app.permissions import RequirePermission, can_access_document, has_permission
+from app.document_access import can_read_document, can_verify_document, can_write_document
+from app.document_output import document_to_out
+from app.permissions import RequirePermission, has_permission
 from app.roles import Role, normalize_role
 from app.schemas import (
     ActivityEventOut,
@@ -50,6 +53,7 @@ from app.schemas import (
     UserRoleUpdate,
 )
 from app.routers.chain import router as chain_router
+from app.routers.collaboration import router as collaboration_router
 from app.routers.organization import collection_router, folder_router, tag_router
 from app.verify_logic import run_document_verify
 from app.services.storage import save_upload
@@ -82,33 +86,6 @@ def _activity_rows_to_out(db: Session, rows: list[ActivityEvent]) -> list[Activi
             )
         )
     return out
-
-
-def document_to_out(doc: Document) -> DocumentOut:
-    tag_ids = [t.id for t in doc.tags] if getattr(doc, "tags", None) else []
-    collection_ids = [c.id for c in doc.collections] if getattr(doc, "collections", None) else []
-    return DocumentOut(
-        id=doc.id,
-        filename=doc.filename,
-        owner_id=doc.owner_id,
-        folder_id=doc.folder_id,
-        tag_ids=tag_ids,
-        collection_ids=collection_ids,
-        upload_date=doc.upload_date,
-        storage_uri=doc.storage_uri,
-        content_sha256_hex=doc.file_hash.hex()
-        if isinstance(doc.file_hash, (bytes, bytearray))
-        else str(doc.file_hash),
-        blockchain_tx_hash=doc.blockchain_tx_hash,
-        version=doc.version,
-        previous_version_id=doc.previous_version_id,
-        deleted_at=doc.deleted_at,
-        legal_hold=bool(doc.legal_hold),
-        retention_expires_at=doc.retention_expires_at,
-        chain_config_id=doc.chain_config_id,
-        merkle_batch_id=doc.merkle_batch_id,
-        pending_merkle=bool(doc.pending_merkle),
-    )
 
 
 def _resolve_folder_for_owner(db: Session, folder_id: int | None, owner_id: int) -> int | None:
@@ -167,6 +144,7 @@ async def lifespan(_: FastAPI):
     ensure_users_role_column()
     ensure_organization_columns()
     ensure_document_retention_columns()
+    ensure_document_lifecycle_column()
     ensure_document_chain_columns()
     ensure_folder_tree_schema()
     ensure_pg_trgm()
@@ -174,11 +152,28 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="DMS", lifespan=lifespan)
+app = FastAPI(
+    title="DMS",
+    lifespan=lifespan,
+    openapi_tags=[
+        {"name": "Authentication", "description": "Register, login, and current user."},
+        {"name": "Documents", "description": "Upload, list, metadata, versions, and verification."},
+        {"name": "Activity", "description": "Audit and activity feeds."},
+        {"name": "Public", "description": "Unauthenticated endpoints (e.g. token-based verify)."},
+        {"name": "Admin", "description": "User management and retention jobs (requires admin permissions)."},
+        {"name": "Health", "description": "Liveness and readiness."},
+        {"name": "Collaboration", "description": "ACL, share links, lifecycle workflow, and shared read/verify."},
+        {"name": "Folders", "description": "Folder tree for organizing documents."},
+        {"name": "Tags", "description": "Tags for documents."},
+        {"name": "Collections", "description": "Document collections."},
+        {"name": "Chain configs", "description": "Blockchain notarization chain configuration."},
+    ],
+)
 app.include_router(folder_router)
 app.include_router(tag_router)
 app.include_router(collection_router)
 app.include_router(chain_router)
+app.include_router(collaboration_router)
 
 
 def _initial_role_for_email(email: str) -> str:
@@ -190,7 +185,12 @@ def _initial_role_for_email(email: str) -> str:
     return Role.user.value
 
 
-@app.post("/auth/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/auth/register",
+    response_model=UserOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Authentication"],
+)
 def register(body: UserCreate, db: Annotated[Session, Depends(get_db)]) -> UserOut:
     existing = db.execute(select(User).where(User.email == body.email)).scalar_one_or_none()
     if existing:
@@ -213,12 +213,12 @@ def register(body: UserCreate, db: Annotated[Session, Depends(get_db)]) -> UserO
     return UserOut.model_validate(user)
 
 
-@app.get("/auth/me", response_model=UserOut)
+@app.get("/auth/me", response_model=UserOut, tags=["Authentication"])
 def auth_me(current_user: Annotated[User, Depends(get_current_user)]) -> UserOut:
     return UserOut.model_validate(current_user)
 
 
-@app.post("/auth/token", response_model=Token)
+@app.post("/auth/token", response_model=Token, tags=["Authentication"])
 def login(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     db: Annotated[Session, Depends(get_db)],
@@ -230,7 +230,7 @@ def login(
     return Token(access_token=token)
 
 
-@app.post("/documents/upload", response_model=DocumentOut)
+@app.post("/documents/upload", response_model=DocumentOut, tags=["Documents"])
 async def upload_document(
     current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
     db: Annotated[Session, Depends(get_db)],
@@ -250,6 +250,7 @@ async def upload_document(
     doc = Document(
         filename=file.filename or "unnamed",
         owner_id=current_user.id,
+        lifecycle_state="draft",
         folder_id=fid,
         storage_uri=storage_uri,
         file_hash=digest,
@@ -280,7 +281,7 @@ async def upload_document(
     return document_to_out(doc)
 
 
-@app.get("/documents", response_model=DocumentListResponse)
+@app.get("/documents", response_model=DocumentListResponse, tags=["Documents"])
 def list_documents(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
@@ -331,6 +332,14 @@ def list_documents(
     trash_only: bool = Query(
         default=False,
         description="Only soft-deleted rows (trash).",
+    ),
+    include_shared: bool = Query(
+        default=True,
+        description="Include documents shared with you via ACL (not only owned).",
+    ),
+    lifecycle_state: str | None = Query(
+        default=None,
+        description="Filter by workflow state: draft, review, published.",
     ),
 ) -> DocumentListResponse:
     if not has_permission(current_user, "documents:read"):
@@ -388,6 +397,8 @@ def list_documents(
             collection_id=collection_id,
             include_deleted=include_deleted,
             trash_only=trash_only,
+            include_shared=include_shared,
+            lifecycle_state=lifecycle_state,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -402,7 +413,7 @@ def list_documents(
     )
 
 
-@app.get("/activity", response_model=ActivityListResponse)
+@app.get("/activity", response_model=ActivityListResponse, tags=["Activity"])
 def list_activity_feed(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
@@ -424,7 +435,7 @@ def list_activity_feed(
         )
     if document_id is not None:
         doc = db.get(Document, document_id)
-        if doc is None or not can_access_document(current_user, doc):
+        if doc is None or not can_read_document(db, current_user, doc):
             raise HTTPException(status_code=404, detail="Document not found")
     where = activity_where_clause(current_user, document_id=document_id, action=action)
     total = db.execute(select(func.count()).select_from(ActivityEvent).where(where)).scalar_one()
@@ -443,7 +454,7 @@ def list_activity_feed(
     )
 
 
-@app.get("/documents/{document_id}", response_model=DocumentOut)
+@app.get("/documents/{document_id}", response_model=DocumentOut, tags=["Documents"])
 def get_document(
     document_id: int,
     current_user: Annotated[User, Depends(get_current_user)],
@@ -464,14 +475,18 @@ def get_document(
         )
         .where(Document.id == document_id)
     ).scalar_one_or_none()
-    if doc is None or not can_access_document(current_user, doc):
+    if doc is None or not can_read_document(db, current_user, doc):
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at is not None and not include_deleted:
         raise HTTPException(status_code=404, detail="Document not found")
     return document_to_out(doc)
 
 
-@app.get("/documents/{document_id}/activity", response_model=ActivityListResponse)
+@app.get(
+    "/documents/{document_id}/activity",
+    response_model=ActivityListResponse,
+    tags=["Activity"],
+)
 def list_document_activity_feed(
     document_id: int,
     current_user: Annotated[User, Depends(get_current_user)],
@@ -490,7 +505,7 @@ def list_document_activity_feed(
             detail="Missing permission: documents:read",
         )
     doc = db.get(Document, document_id)
-    if doc is None or not can_access_document(current_user, doc):
+    if doc is None or not can_read_document(db, current_user, doc):
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at is not None and not include_deleted:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -511,7 +526,7 @@ def list_document_activity_feed(
     )
 
 
-@app.patch("/documents/{document_id}", response_model=DocumentOut)
+@app.patch("/documents/{document_id}", response_model=DocumentOut, tags=["Documents"])
 def update_document_metadata(
     document_id: int,
     body: DocumentMetadataUpdate,
@@ -526,23 +541,24 @@ def update_document_metadata(
         )
         .where(Document.id == document_id)
     ).scalar_one_or_none()
-    if doc is None or doc.owner_id != current_user.id:
+    if doc is None or not can_write_document(db, current_user, doc):
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at is not None:
         raise HTTPException(status_code=409, detail="Document is deleted; restore before editing metadata")
+    org_owner = doc.owner_id
     patch = body.model_dump(exclude_unset=True)
     if "folder_id" in patch:
         if patch["folder_id"] is None:
             doc.folder_id = None
         else:
-            doc.folder_id = _resolve_folder_for_owner(db, patch["folder_id"], current_user.id)
+            doc.folder_id = _resolve_folder_for_owner(db, patch["folder_id"], org_owner)
     if "tag_ids" in patch:
         tids = patch["tag_ids"]
         if not tids:
             doc.tags = []
         else:
             tags = db.execute(
-                select(Tag).where(Tag.id.in_(tids), Tag.owner_id == current_user.id)
+                select(Tag).where(Tag.id.in_(tids), Tag.owner_id == org_owner)
             ).scalars().all()
             if len(tags) != len(set(tids)):
                 raise HTTPException(status_code=400, detail="Invalid or duplicate tag ids")
@@ -555,7 +571,7 @@ def update_document_metadata(
             cols = db.execute(
                 select(Collection).where(
                     Collection.id.in_(cids),
-                    Collection.owner_id == current_user.id,
+                    Collection.owner_id == org_owner,
                 )
             ).scalars().all()
             if len(cols) != len(set(cids)):
@@ -578,14 +594,14 @@ def update_document_metadata(
     return document_to_out(doc)
 
 
-@app.delete("/documents/{document_id}", response_model=DocumentOut)
+@app.delete("/documents/{document_id}", response_model=DocumentOut, tags=["Documents"])
 def soft_delete_document(
     document_id: int,
     current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
     db: Annotated[Session, Depends(get_db)],
 ) -> DocumentOut:
     doc = db.get(Document, document_id)
-    if doc is None or doc.owner_id != current_user.id:
+    if doc is None or not can_write_document(db, current_user, doc):
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at is not None:
         raise HTTPException(status_code=409, detail="Document is already deleted")
@@ -606,14 +622,14 @@ def soft_delete_document(
     return document_to_out(doc)
 
 
-@app.post("/documents/{document_id}/restore", response_model=DocumentOut)
+@app.post("/documents/{document_id}/restore", response_model=DocumentOut, tags=["Documents"])
 def restore_document(
     document_id: int,
     current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
     db: Annotated[Session, Depends(get_db)],
 ) -> DocumentOut:
     doc = db.get(Document, document_id)
-    if doc is None or doc.owner_id != current_user.id:
+    if doc is None or not can_write_document(db, current_user, doc):
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at is None:
         raise HTTPException(status_code=409, detail="Document is not deleted")
@@ -629,7 +645,7 @@ def restore_document(
     return document_to_out(doc)
 
 
-@app.post("/documents/{document_id}/versions", response_model=DocumentOut)
+@app.post("/documents/{document_id}/versions", response_model=DocumentOut, tags=["Documents"])
 async def upload_new_version(
     document_id: int,
     current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
@@ -643,7 +659,7 @@ async def upload_new_version(
         .options(selectinload(Document.tags), selectinload(Document.collections))
         .where(Document.id == document_id)
     ).scalar_one_or_none()
-    if parent is None or parent.owner_id != current_user.id:
+    if parent is None or not can_write_document(db, current_user, parent):
         raise HTTPException(status_code=404, detail="Document not found")
     if parent.deleted_at is not None:
         raise HTTPException(
@@ -657,7 +673,8 @@ async def upload_new_version(
     cid = chain_config_id if chain_config_id is not None else parent.chain_config_id
     new_doc = Document(
         filename=file.filename or parent.filename,
-        owner_id=current_user.id,
+        owner_id=parent.owner_id,
+        lifecycle_state=parent.lifecycle_state,
         folder_id=parent.folder_id,
         chain_config_id=cid,
         storage_uri=storage_uri,
@@ -676,10 +693,22 @@ async def upload_new_version(
         digest,
         chain_config_id=cid,
         defer_notarization=defer_notarization,
-        owner_id=current_user.id,
+        owner_id=parent.owner_id,
     )
     new_doc.tags = list(parent.tags)
     new_doc.collections = list(parent.collections)
+    for p in (
+        db.execute(select(DocumentPermission).where(DocumentPermission.document_id == parent.id))
+        .scalars()
+        .all()
+    ):
+        db.add(
+            DocumentPermission(
+                document_id=new_doc.id,
+                user_id=p.user_id,
+                permission=p.permission,
+            )
+        )
     log_activity(
         db,
         actor_user_id=current_user.id,
@@ -696,10 +725,14 @@ async def upload_new_version(
     return document_to_out(new_doc)
 
 
-@app.get("/documents/{document_id}/verify", response_model=DocumentVerifyResult)
+@app.get(
+    "/documents/{document_id}/verify",
+    response_model=DocumentVerifyResult,
+    tags=["Documents"],
+)
 def verify_document(
     document_id: int,
-    current_user: Annotated[User, Depends(RequirePermission("documents:verify"))],
+    current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
     include_deleted: bool = Query(
         default=False,
@@ -707,14 +740,23 @@ def verify_document(
     ),
 ) -> DocumentVerifyResult:
     doc = db.get(Document, document_id)
-    if doc is None or not can_access_document(current_user, doc):
+    if doc is None or not can_read_document(db, current_user, doc):
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at is not None and not include_deleted:
         raise HTTPException(status_code=404, detail="Document not found")
+    if not can_verify_document(db, current_user, doc):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not allowed to verify this document (needs documents:verify or ACL verify on the document).",
+        )
     return run_document_verify(db, doc, actor_user_id=current_user.id, log_activity_events=True)
 
 
-@app.post("/documents/{document_id}/verify-link", response_model=PublicVerifyLinkOut)
+@app.post(
+    "/documents/{document_id}/verify-link",
+    response_model=PublicVerifyLinkOut,
+    tags=["Documents"],
+)
 def create_public_verify_link(
     document_id: int,
     body: PublicVerifyLinkCreate,
@@ -732,7 +774,7 @@ def create_public_verify_link(
     )
 
 
-@app.get("/public/verify", response_model=DocumentVerifyResult)
+@app.get("/public/verify", response_model=DocumentVerifyResult, tags=["Public"])
 def public_verify_document(
     db: Annotated[Session, Depends(get_db)],
     t: str = Query(..., description="JWT from POST /documents/{id}/verify-link"),
@@ -781,7 +823,7 @@ def _assert_can_remove_admin(db: Session, target: User) -> None:
         )
 
 
-@app.post("/admin/retention/apply", response_model=RetentionApplyOut)
+@app.post("/admin/retention/apply", response_model=RetentionApplyOut, tags=["Admin"])
 def admin_apply_retention(
     admin: Annotated[User, Depends(RequirePermission("users:manage"))],
     db: Annotated[Session, Depends(get_db)],
@@ -809,7 +851,7 @@ def admin_apply_retention(
     return RetentionApplyOut(soft_deleted_count=count)
 
 
-@app.get("/admin/users", response_model=list[UserOut])
+@app.get("/admin/users", response_model=list[UserOut], tags=["Admin"])
 def admin_list_users(
     _: Annotated[User, Depends(RequirePermission("users:manage"))],
     db: Annotated[Session, Depends(get_db)],
@@ -824,7 +866,7 @@ def admin_list_users(
     return [UserOut.model_validate(u) for u in rows]
 
 
-@app.get("/admin/users/{user_id}", response_model=UserOut)
+@app.get("/admin/users/{user_id}", response_model=UserOut, tags=["Admin"])
 def admin_get_user(
     user_id: int,
     _: Annotated[User, Depends(RequirePermission("users:manage"))],
@@ -836,7 +878,12 @@ def admin_get_user(
     return UserOut.model_validate(target)
 
 
-@app.post("/admin/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/admin/users",
+    response_model=UserOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Admin"],
+)
 def admin_create_user(
     body: AdminUserCreate,
     admin: Annotated[User, Depends(RequirePermission("users:manage"))],
@@ -864,7 +911,7 @@ def admin_create_user(
     return UserOut.model_validate(user)
 
 
-@app.patch("/admin/users/{user_id}", response_model=UserOut)
+@app.patch("/admin/users/{user_id}", response_model=UserOut, tags=["Admin"])
 def admin_update_user(
     user_id: int,
     body: AdminUserUpdate,
@@ -908,7 +955,7 @@ def admin_update_user(
     return UserOut.model_validate(target)
 
 
-@app.delete("/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Admin"])
 def admin_delete_user(
     user_id: int,
     admin: Annotated[User, Depends(RequirePermission("users:manage"))],
@@ -936,7 +983,7 @@ def admin_delete_user(
     db.commit()
 
 
-@app.patch("/admin/users/{user_id}/role", response_model=UserOut)
+@app.patch("/admin/users/{user_id}/role", response_model=UserOut, tags=["Admin"])
 def admin_set_user_role(
     user_id: int,
     body: UserRoleUpdate,
@@ -961,6 +1008,6 @@ def admin_set_user_role(
     return UserOut.model_validate(target)
 
 
-@app.get("/health")
+@app.get("/health", tags=["Health"])
 def health() -> dict[str, str]:
     return {"status": "ok"}

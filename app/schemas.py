@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
@@ -169,8 +170,57 @@ class DocumentOut(BaseModel):
     deleted_at: datetime | None = None
     legal_hold: bool = False
     retention_expires_at: datetime | None = None
+    lifecycle_state: str = Field(
+        default="published",
+        description="draft → review → published (workflow); legacy rows default published.",
+    )
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DocumentPermissionCreate(BaseModel):
+    user_id: int
+    permission: Literal["read", "write", "verify", "approve"]
+
+
+class DocumentPermissionOut(BaseModel):
+    id: int
+    document_id: int
+    user_id: int
+    user_email: str | None = None
+    permission: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DocumentShareLinkCreate(BaseModel):
+    expires_in_hours: int = Field(default=168, ge=1, le=8760)
+    permission: Literal["read", "verify"]
+
+
+class DocumentShareLinkOut(BaseModel):
+    id: int
+    document_id: int
+    permission: str
+    expires_at: datetime
+    token: str
+    share_path: str
+
+
+class LifecycleTransitionBody(BaseModel):
+    transition: Literal["submit_review", "approve", "reject", "unpublish"]
+
+
+class DocumentSharedOut(BaseModel):
+    """Public share response (no storage path)."""
+
+    id: int
+    filename: str
+    owner_id: int
+    version: int
+    upload_date: datetime
+    content_sha256_hex: str
+    lifecycle_state: str
 
 
 class DocumentMetadataUpdate(BaseModel):

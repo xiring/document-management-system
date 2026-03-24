@@ -5,11 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.selectable import Select
 
-from app.models import Document, collection_documents, document_tags
+from app.models import Document, DocumentPermission, collection_documents, document_tags
 
 
 def escape_ilike_pattern(q: str) -> str:
@@ -42,6 +42,8 @@ def build_document_list_filters(
     collection_id: int | None,
     include_deleted: bool,
     trash_only: bool,
+    include_shared: bool = True,
+    lifecycle_state: str | None = None,
 ) -> list[Any]:
     conditions: list[Any] = []
 
@@ -51,7 +53,15 @@ def build_document_list_filters(
         conditions.append(Document.deleted_at.is_(None))
 
     if not read_all:
-        conditions.append(Document.owner_id == current_user_id)
+        if include_shared:
+            shared_ids = select(DocumentPermission.document_id).where(
+                DocumentPermission.user_id == current_user_id
+            )
+            conditions.append(
+                or_(Document.owner_id == current_user_id, Document.id.in_(shared_ids))
+            )
+        else:
+            conditions.append(Document.owner_id == current_user_id)
     elif owner_id is not None:
         conditions.append(Document.owner_id == owner_id)
 
@@ -97,6 +107,9 @@ def build_document_list_filters(
                 )
             )
         )
+
+    if lifecycle_state is not None:
+        conditions.append(Document.lifecycle_state == lifecycle_state)
 
     return conditions
 

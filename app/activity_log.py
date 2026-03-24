@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
-from app.models import ActivityEvent, Document, User
+from app.models import ActivityEvent, Document, DocumentPermission, User
 from app.permissions import has_permission
 
 
@@ -30,6 +30,12 @@ class ActivityAction:
     RETENTION_APPLIED = "retention.applied"
 
     MERKLE_BATCH_COMMITTED = "merkle.batch_committed"
+
+    DOCUMENT_ACL_SET = "document.acl_set"
+    DOCUMENT_ACL_DELETE = "document.acl_delete"
+    DOCUMENT_SHARE_LINK = "document.share_link"
+    DOCUMENT_SHARE_LINK_DELETE = "document.share_link_delete"
+    DOCUMENT_LIFECYCLE = "document.lifecycle"
 
 
 def log_activity(
@@ -55,10 +61,14 @@ def log_activity(
 def activity_visibility_filter(current_user: User) -> Any:
     """Events visible to this user when they do not have `documents:read_all`."""
     own_docs = select(Document.id).where(Document.owner_id == current_user.id)
+    shared_docs = select(DocumentPermission.document_id).where(
+        DocumentPermission.user_id == current_user.id
+    )
     return or_(
         ActivityEvent.actor_user_id == current_user.id,
         ActivityEvent.target_user_id == current_user.id,
         ActivityEvent.document_id.in_(own_docs),
+        ActivityEvent.document_id.in_(shared_docs),
     )
 
 

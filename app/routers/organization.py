@@ -22,9 +22,9 @@ from app.schemas import (
     TagOut,
 )
 
-folder_router = APIRouter(prefix="/folders", tags=["folders"])
-tag_router = APIRouter(prefix="/tags", tags=["tags"])
-collection_router = APIRouter(prefix="/collections", tags=["collections"])
+folder_router = APIRouter(prefix="/folders", tags=["Folders"])
+tag_router = APIRouter(prefix="/tags", tags=["Tags"])
+collection_router = APIRouter(prefix="/collections", tags=["Collections"])
 
 
 def _read_all(user: User) -> bool:

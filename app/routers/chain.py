@@ -17,7 +17,7 @@ from app.models import ChainConfig, Document, MerkleBatch, User
 from app.permissions import RequirePermission
 from app.schemas import ChainConfigCreate, ChainConfigOut, ChainConfigUpdate, MerkleCommitOut
 
-router = APIRouter(prefix="/chain-configs", tags=["chain-configs"])
+router = APIRouter(prefix="/chain-configs", tags=["Chain configs"])
 
 
 def _get_owned_config(db: Session, config_id: int, user_id: int) -> ChainConfig:

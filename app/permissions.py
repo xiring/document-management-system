@@ -2,7 +2,7 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
 
-from app.models import Document, User
+from app.models import User
 from app.roles import ROLE_PERMISSIONS, Role, normalize_role
 from app.auth import get_current_user
 
@@ -14,13 +14,6 @@ def permissions_for(user: User) -> frozenset[str]:
 
 def has_permission(user: User, permission: str) -> bool:
     return permission in permissions_for(user)
-
-
-def can_access_document(user: User, doc: Document) -> bool:
-    """Read/verify access: own documents, or any document if `documents:read_all`."""
-    if doc.owner_id == user.id:
-        return has_permission(user, "documents:read") or has_permission(user, "documents:read_all")
-    return has_permission(user, "documents:read_all")
 
 
 class RequirePermission:
