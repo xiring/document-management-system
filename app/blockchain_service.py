@@ -1,10 +1,14 @@
+import logging
 import os
 from typing import Any
 
 from web3 import Web3
 from web3.contract import Contract
+from web3.exceptions import BadFunctionCallOutput, ContractLogicError
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Minimal ABI for DocumentNotary.sol (notarize + documentOwner mapping reader)
 NOTARY_ABI: list[dict[str, Any]] = [
@@ -113,7 +117,12 @@ def get_on_chain_owner(file_hash: bytes) -> str | None:
     if contract is None:
         return None
     h32 = file_hash if len(file_hash) == 32 else bytes.fromhex(file_hash.hex())[:32]
-    addr = contract.functions.documentOwner(h32).call()
+    try:
+        addr = contract.functions.documentOwner(h32).call()
+    except (BadFunctionCallOutput, ContractLogicError, ValueError, OSError) as e:
+        # Wrong network, non-contract address, empty eth_call return, RPC errors — treat as unknown.
+        logger.warning("documentOwner call failed (check CONTRACT_ADDRESS, CHAIN_ID, RPC): %s", e)
+        return None
     if addr == "0x0000000000000000000000000000000000000000":
         return None
     return Web3.to_checksum_address(addr)

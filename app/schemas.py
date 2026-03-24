@@ -204,6 +204,27 @@ class DocumentListResponse(BaseModel):
     )
 
 
+class ActivityEventOut(BaseModel):
+    """Single row for audit / activity UI (who did what, when)."""
+
+    id: int
+    created_at: datetime
+    action: str
+    actor_user_id: int | None = None
+    actor_email: str | None = None
+    document_id: int | None = None
+    target_user_id: int | None = None
+    target_email: str | None = None
+    payload: dict | None = None
+
+
+class ActivityListResponse(BaseModel):
+    items: list[ActivityEventOut]
+    total: int
+    skip: int
+    limit: int
+
+
 class DocumentVerifyResult(BaseModel):
     document_id: int
     content_matches_stored_hash: bool = Field(

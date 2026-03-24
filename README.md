@@ -94,6 +94,8 @@ Protected routes require `Authorization: Bearer <token>`. Access depends on role
 | `GET`–`POST`–`DELETE` | `/tags`, `/tags/{id}` | Tag CRUD |
 | `GET`–`POST`–`PATCH`–`DELETE` | `/collections`, `/collections/{id}`, … | Collections + document membership |
 | `GET` | `/documents/{id}` | Get metadata; query `include_deleted` to read trashed rows (own, or any if `manager`/`admin`) |
+| `GET` | `/activity` | Audit / activity feed: `{ items, total, skip, limit }`. Optional `document_id`, `action` (`documents:read`) |
+| `GET` | `/documents/{id}/activity` | Same feed scoped to one document; optional `include_deleted` for trashed docs (`documents:read`) |
 | `POST` | `/documents/{id}/versions` | New version for **your** document only (409 if parent is soft-deleted) |
 | `GET` | `/documents/{id}/verify` | Content verification; query `include_deleted` to verify a trashed row |
 | `GET` | `/admin/users` | List users with pagination: `skip`, `limit` (default 100, max 500; `users:manage`) |
@@ -114,6 +116,10 @@ The `content_sha256_hex` field in responses is the digest of **file bytes**, not
 - **Collections** — named groups: `GET/POST /collections`, `GET/PATCH/DELETE /collections/{id}`, and `POST/DELETE /collections/{id}/documents/{document_id}` to add/remove a document. `PATCH /documents/{id}` with `collection_ids` replaces membership in all listed collections (omit field to leave unchanged).
 
 `DocumentOut` includes `folder_id`, `tag_ids`, `collection_ids`, `deleted_at`, `legal_hold`, and `retention_expires_at`. New document versions inherit folder, tags, collections, `legal_hold`, and `retention_expires_at` from the parent row.
+
+### Activity / audit feed
+
+`GET /activity` and `GET /documents/{id}/activity` return append-only events (uploads, new versions, verify runs, metadata changes, soft-delete/restore, self-registration, admin user/role actions, retention job). Each row includes `action` (e.g. `document.upload`, `document.verify`, `user.role_changed`), `actor_user_id` / `actor_email`, optional `document_id`, optional `target_user_id` / `target_email`, and `payload` (JSON details). **Managers and admins** (`documents:read_all`) see the full feed. **Other users** see events they caused, events where they are the `target_user`, or events tied to **their** documents (e.g. a manager’s verify on your file).
 
 ### Soft delete and retention
 
@@ -138,6 +144,7 @@ The `content_sha256_hex` field in responses is the digest of **file bytes**, not
 ```text
 app/
   main.py              # FastAPI routes
+  activity_log.py      # Audit event helpers and visibility filters
   database.py          # Engine and sessions
   models.py            # SQLAlchemy models
   schemas.py           # Pydantic models

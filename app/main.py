@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, selectinload
 
 load_dotenv()
 
+from app.activity_log import ActivityAction, activity_where_clause, log_activity
 from app.auth import create_access_token, get_current_user, hash_password, verify_password
 from app.config import settings
 from app.database import (
@@ -24,11 +25,13 @@ from app.database import (
     promote_bootstrap_admin_if_configured,
 )
 from app.document_search import build_document_list_filters, document_count_query, document_list_query
-from app.models import Collection, Document, Folder, Tag, User
+from app.models import ActivityEvent, Collection, Document, Folder, Tag, User
 from app.blockchain_service import get_on_chain_owner, is_notarization_configured, notarize_hash
 from app.permissions import RequirePermission, can_access_document, has_permission
 from app.roles import Role, normalize_role
 from app.schemas import (
+    ActivityEventOut,
+    ActivityListResponse,
     AdminUserCreate,
     AdminUserUpdate,
     DocumentListResponse,
@@ -43,6 +46,35 @@ from app.schemas import (
 )
 from app.routers.organization import collection_router, folder_router, tag_router
 from app.services.storage import read_stored_file, save_upload, sha256_bytes
+
+
+def _activity_rows_to_out(db: Session, rows: list[ActivityEvent]) -> list[ActivityEventOut]:
+    uids: set[int] = set()
+    for e in rows:
+        if e.actor_user_id is not None:
+            uids.add(e.actor_user_id)
+        if e.target_user_id is not None:
+            uids.add(e.target_user_id)
+    emails: dict[int, str] = {}
+    if uids:
+        users = db.execute(select(User).where(User.id.in_(uids))).scalars().all()
+        emails = {u.id: u.email for u in users}
+    out: list[ActivityEventOut] = []
+    for e in rows:
+        out.append(
+            ActivityEventOut(
+                id=e.id,
+                created_at=e.created_at,
+                action=e.action,
+                actor_user_id=e.actor_user_id,
+                actor_email=emails.get(e.actor_user_id) if e.actor_user_id is not None else None,
+                document_id=e.document_id,
+                target_user_id=e.target_user_id,
+                target_email=emails.get(e.target_user_id) if e.target_user_id is not None else None,
+                payload=e.payload,
+            )
+        )
+    return out
 
 
 def document_to_out(doc: Document) -> DocumentOut:
@@ -116,6 +148,13 @@ def register(body: UserCreate, db: Annotated[Session, Depends(get_db)]) -> UserO
         role=_initial_role_for_email(body.email),
     )
     db.add(user)
+    db.flush()
+    log_activity(
+        db,
+        actor_user_id=user.id,
+        action=ActivityAction.USER_REGISTERED,
+        payload={"email": user.email},
+    )
     db.commit()
     db.refresh(user)
     return UserOut.model_validate(user)
@@ -166,6 +205,14 @@ async def upload_document(
         retention_expires_at=retention,
     )
     db.add(doc)
+    db.flush()
+    log_activity(
+        db,
+        actor_user_id=current_user.id,
+        action=ActivityAction.DOCUMENT_UPLOAD,
+        document_id=doc.id,
+        payload={"filename": doc.filename, "version": doc.version},
+    )
     db.commit()
     db.refresh(doc)
     return document_to_out(doc)
@@ -293,6 +340,47 @@ def list_documents(
     )
 
 
+@app.get("/activity", response_model=ActivityListResponse)
+def list_activity_feed(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=500),
+    document_id: int | None = Query(
+        default=None,
+        description="Only events for this document (must be allowed to access the document).",
+    ),
+    action: str | None = Query(
+        default=None,
+        description="Exact action string (e.g. document.upload, user.role_changed).",
+    ),
+) -> ActivityListResponse:
+    if not has_permission(current_user, "documents:read"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Missing permission: documents:read",
+        )
+    if document_id is not None:
+        doc = db.get(Document, document_id)
+        if doc is None or not can_access_document(current_user, doc):
+            raise HTTPException(status_code=404, detail="Document not found")
+    where = activity_where_clause(current_user, document_id=document_id, action=action)
+    total = db.execute(select(func.count()).select_from(ActivityEvent).where(where)).scalar_one()
+    rows = db.execute(
+        select(ActivityEvent)
+        .where(where)
+        .order_by(ActivityEvent.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    ).scalars().all()
+    return ActivityListResponse(
+        items=_activity_rows_to_out(db, rows),
+        total=int(total),
+        skip=skip,
+        limit=limit,
+    )
+
+
 @app.get("/documents/{document_id}", response_model=DocumentOut)
 def get_document(
     document_id: int,
@@ -319,6 +407,46 @@ def get_document(
     if doc.deleted_at is not None and not include_deleted:
         raise HTTPException(status_code=404, detail="Document not found")
     return document_to_out(doc)
+
+
+@app.get("/documents/{document_id}/activity", response_model=ActivityListResponse)
+def list_document_activity_feed(
+    document_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=500),
+    action: str | None = Query(default=None, description="Exact action filter."),
+    include_deleted: bool = Query(
+        default=False,
+        description="Allow activity for a soft-deleted document.",
+    ),
+) -> ActivityListResponse:
+    if not has_permission(current_user, "documents:read"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Missing permission: documents:read",
+        )
+    doc = db.get(Document, document_id)
+    if doc is None or not can_access_document(current_user, doc):
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.deleted_at is not None and not include_deleted:
+        raise HTTPException(status_code=404, detail="Document not found")
+    where = activity_where_clause(current_user, document_id=document_id, action=action)
+    total = db.execute(select(func.count()).select_from(ActivityEvent).where(where)).scalar_one()
+    rows = db.execute(
+        select(ActivityEvent)
+        .where(where)
+        .order_by(ActivityEvent.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    ).scalars().all()
+    return ActivityListResponse(
+        items=_activity_rows_to_out(db, rows),
+        total=int(total),
+        skip=skip,
+        limit=limit,
+    )
 
 
 @app.patch("/documents/{document_id}", response_model=DocumentOut)
@@ -375,6 +503,14 @@ def update_document_metadata(
         doc.legal_hold = bool(patch["legal_hold"])
     if "retention_expires_at" in patch:
         doc.retention_expires_at = patch["retention_expires_at"]
+    if patch:
+        log_activity(
+            db,
+            actor_user_id=current_user.id,
+            action=ActivityAction.DOCUMENT_METADATA,
+            document_id=doc.id,
+            payload={"fields": sorted(patch.keys())},
+        )
     db.commit()
     db.refresh(doc)
     return document_to_out(doc)
@@ -397,6 +533,12 @@ def soft_delete_document(
             detail="Document is under legal hold; clear legal_hold before delete.",
         )
     doc.deleted_at = datetime.now(timezone.utc)
+    log_activity(
+        db,
+        actor_user_id=current_user.id,
+        action=ActivityAction.DOCUMENT_DELETE,
+        document_id=doc.id,
+    )
     db.commit()
     db.refresh(doc)
     return document_to_out(doc)
@@ -414,6 +556,12 @@ def restore_document(
     if doc.deleted_at is None:
         raise HTTPException(status_code=409, detail="Document is not deleted")
     doc.deleted_at = None
+    log_activity(
+        db,
+        actor_user_id=current_user.id,
+        action=ActivityAction.DOCUMENT_RESTORE,
+        document_id=doc.id,
+    )
     db.commit()
     db.refresh(doc)
     return document_to_out(doc)
@@ -459,6 +607,17 @@ async def upload_new_version(
     db.flush()
     new_doc.tags = list(parent.tags)
     new_doc.collections = list(parent.collections)
+    log_activity(
+        db,
+        actor_user_id=current_user.id,
+        action=ActivityAction.DOCUMENT_VERSION,
+        document_id=new_doc.id,
+        payload={
+            "version": new_doc.version,
+            "previous_version_id": parent.id,
+            "filename": new_doc.filename,
+        },
+    )
     db.commit()
     db.refresh(new_doc)
     return document_to_out(new_doc)
@@ -497,6 +656,14 @@ def verify_document(
         raw = read_stored_file(doc.storage_uri)
     except FileNotFoundError:
         stored_hex = doc.file_hash.hex() if isinstance(doc.file_hash, (bytes, bytearray)) else None
+        log_activity(
+            db,
+            actor_user_id=current_user.id,
+            action=ActivityAction.DOCUMENT_VERIFY,
+            document_id=doc.id,
+            payload={"outcome": "missing_file"},
+        )
+        db.commit()
         return DocumentVerifyResult(
             document_id=doc.id,
             content_matches_stored_hash=False,
@@ -548,6 +715,20 @@ def verify_document(
         else:
             parts.append("The file no longer matches the hash that was notarized on-chain.")
 
+    log_activity(
+        db,
+        actor_user_id=current_user.id,
+        action=ActivityAction.DOCUMENT_VERIFY,
+        document_id=doc.id,
+        payload={
+            "outcome": "ok",
+            "content_matches_stored_hash": matches_record,
+            "content_hash_matches_blockchain": matches_chain,
+            "is_latest_version": is_latest,
+            "newer_version_document_id": successor_id,
+        },
+    )
+    db.commit()
     return DocumentVerifyResult(
         document_id=doc.id,
         content_matches_stored_hash=matches_record,
@@ -597,7 +778,7 @@ def _assert_can_remove_admin(db: Session, target: User) -> None:
 
 @app.post("/admin/retention/apply", response_model=RetentionApplyOut)
 def admin_apply_retention(
-    _: Annotated[User, Depends(RequirePermission("users:manage"))],
+    admin: Annotated[User, Depends(RequirePermission("users:manage"))],
     db: Annotated[Session, Depends(get_db)],
 ) -> RetentionApplyOut:
     """Soft-delete active documents whose retention window has passed (skips legal hold)."""
@@ -612,8 +793,15 @@ def admin_apply_retention(
         )
         .values(deleted_at=now)
     )
+    count = int(res.rowcount or 0)
+    log_activity(
+        db,
+        actor_user_id=admin.id,
+        action=ActivityAction.RETENTION_APPLIED,
+        payload={"soft_deleted_count": count},
+    )
     db.commit()
-    return RetentionApplyOut(soft_deleted_count=int(res.rowcount or 0))
+    return RetentionApplyOut(soft_deleted_count=count)
 
 
 @app.get("/admin/users", response_model=list[UserOut])
@@ -646,7 +834,7 @@ def admin_get_user(
 @app.post("/admin/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 def admin_create_user(
     body: AdminUserCreate,
-    _: Annotated[User, Depends(RequirePermission("users:manage"))],
+    admin: Annotated[User, Depends(RequirePermission("users:manage"))],
     db: Annotated[Session, Depends(get_db)],
 ) -> UserOut:
     existing = db.execute(select(User).where(User.email == body.email)).scalar_one_or_none()
@@ -658,6 +846,14 @@ def admin_create_user(
         role=body.role,
     )
     db.add(user)
+    db.flush()
+    log_activity(
+        db,
+        actor_user_id=admin.id,
+        action=ActivityAction.USER_ADMIN_CREATE,
+        target_user_id=user.id,
+        payload={"email": user.email, "role": user.role},
+    )
     db.commit()
     db.refresh(user)
     return UserOut.model_validate(user)
@@ -667,12 +863,14 @@ def admin_create_user(
 def admin_update_user(
     user_id: int,
     body: AdminUserUpdate,
-    _: Annotated[User, Depends(RequirePermission("users:manage"))],
+    admin: Annotated[User, Depends(RequirePermission("users:manage"))],
     db: Annotated[Session, Depends(get_db)],
 ) -> UserOut:
     target = db.get(User, user_id)
     if target is None:
         raise HTTPException(status_code=404, detail="User not found")
+    old_email = target.email
+    old_role = target.role
     if body.role is not None:
         _assert_can_change_admin_role(db, target, body.role)
         target.role = body.role
@@ -685,6 +883,21 @@ def admin_update_user(
         target.email = body.email
     if body.password is not None:
         target.hashed_password = hash_password(body.password)
+    payload: dict = {}
+    if body.role is not None:
+        payload["role"] = {"from": old_role, "to": body.role}
+    if body.email is not None:
+        payload["email"] = {"from": old_email, "to": body.email}
+    if body.password is not None:
+        payload["password_changed"] = True
+    if payload:
+        log_activity(
+            db,
+            actor_user_id=admin.id,
+            action=ActivityAction.USER_ADMIN_UPDATE,
+            target_user_id=target.id,
+            payload=payload,
+        )
     db.commit()
     db.refresh(target)
     return UserOut.model_validate(target)
@@ -707,6 +920,13 @@ def admin_delete_user(
             detail="User still owns documents; delete or reassign documents first.",
         )
     _assert_can_remove_admin(db, target)
+    log_activity(
+        db,
+        actor_user_id=admin.id,
+        action=ActivityAction.USER_ADMIN_DELETE,
+        target_user_id=target.id,
+        payload={"email": target.email},
+    )
     db.delete(target)
     db.commit()
 
@@ -715,14 +935,22 @@ def admin_delete_user(
 def admin_set_user_role(
     user_id: int,
     body: UserRoleUpdate,
-    _: Annotated[User, Depends(RequirePermission("users:manage"))],
+    admin: Annotated[User, Depends(RequirePermission("users:manage"))],
     db: Annotated[Session, Depends(get_db)],
 ) -> UserOut:
     target = db.get(User, user_id)
     if target is None:
         raise HTTPException(status_code=404, detail="User not found")
+    old_role = target.role
     _assert_can_change_admin_role(db, target, body.role)
     target.role = body.role
+    log_activity(
+        db,
+        actor_user_id=admin.id,
+        action=ActivityAction.USER_ROLE_CHANGED,
+        target_user_id=target.id,
+        payload={"from": old_role, "to": body.role},
+    )
     db.commit()
     db.refresh(target)
     return UserOut.model_validate(target)
