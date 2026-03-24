@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
@@ -71,10 +73,88 @@ class TokenPayload(BaseModel):
     sub: str | None = None
 
 
+class FolderOut(BaseModel):
+    id: int
+    owner_id: int
+    parent_id: int | None = None
+    name: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class FolderCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    parent_id: int | None = Field(
+        default=None,
+        description="Parent folder id; omit or null for a top-level folder.",
+    )
+
+
+class DocumentTreeSummary(BaseModel):
+    id: int
+    filename: str
+    version: int
+    upload_date: datetime
+
+
+class FolderTreeNode(BaseModel):
+    id: int
+    owner_id: int
+    parent_id: int | None
+    name: str
+    children: list["FolderTreeNode"]
+    documents: list[DocumentTreeSummary]
+
+
+class DocumentTreeResponse(BaseModel):
+    owner_id: int
+    roots: list[FolderTreeNode]
+    orphan_documents: list[DocumentTreeSummary]
+
+
+
+
+class TagOut(BaseModel):
+    id: int
+    owner_id: int
+    name: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TagCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+
+
+class CollectionOut(BaseModel):
+    id: int
+    owner_id: int
+    name: str
+    description: str | None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CollectionCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+
+
+class CollectionUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+
+
 class DocumentOut(BaseModel):
     id: int
     filename: str
     owner_id: int
+    folder_id: int | None = None
+    tag_ids: list[int] = Field(default_factory=list)
+    collection_ids: list[int] = Field(default_factory=list)
     upload_date: datetime
     storage_uri: str
     content_sha256_hex: str = Field(
@@ -85,6 +165,18 @@ class DocumentOut(BaseModel):
     previous_version_id: int | None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DocumentMetadataUpdate(BaseModel):
+    folder_id: int | None = None
+    tag_ids: list[int] | None = Field(
+        default=None,
+        description="Replace all tags for this document; omit to leave unchanged.",
+    )
+    collection_ids: list[int] | None = Field(
+        default=None,
+        description="Replace all collection memberships for this document; omit to leave unchanged.",
+    )
 
 
 class DocumentListResponse(BaseModel):

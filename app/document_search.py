@@ -6,9 +6,10 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import and_, func, select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.selectable import Select
 
-from app.models import Document
+from app.models import Document, collection_documents, document_tags
 
 
 def escape_ilike_pattern(q: str) -> str:
@@ -36,6 +37,9 @@ def build_document_list_filters(
     version: int | None,
     version_min: int | None,
     version_max: int | None,
+    folder_id: int | None,
+    tag_ids: list[int] | None,
+    collection_id: int | None,
 ) -> list[Any]:
     conditions: list[Any] = []
 
@@ -46,7 +50,6 @@ def build_document_list_filters(
 
     if q is not None and (q_stripped := q.strip()):
         if search_mode == "trigram":
-            # similarity() is provided by pg_trgm (see ensure_pg_trgm on startup)
             conditions.append(func.similarity(Document.filename, q_stripped) > 0.12)
         else:
             safe = escape_ilike_pattern(q_stripped)
@@ -67,6 +70,26 @@ def build_document_list_filters(
         conditions.append(Document.version >= version_min)
     if version_max is not None:
         conditions.append(Document.version <= version_max)
+
+    if folder_id is not None:
+        conditions.append(Document.folder_id == folder_id)
+
+    if tag_ids:
+        for tid in tag_ids:
+            conditions.append(
+                Document.id.in_(
+                    select(document_tags.c.document_id).where(document_tags.c.tag_id == tid)
+                )
+            )
+
+    if collection_id is not None:
+        conditions.append(
+            Document.id.in_(
+                select(collection_documents.c.document_id).where(
+                    collection_documents.c.collection_id == collection_id
+                )
+            )
+        )
 
     return conditions
 
@@ -89,8 +112,15 @@ def document_list_query(
     *,
     skip: int,
     limit: int | None,
+    eager_org: bool = True,
 ) -> Select[Any]:
     stmt = select(Document).order_by(Document.upload_date.desc(), Document.id.desc())
+    if eager_org:
+        stmt = stmt.options(
+            selectinload(Document.tags),
+            selectinload(Document.collections),
+            selectinload(Document.folder),
+        )
     stmt = apply_filters_to_select(stmt, conditions)
     stmt = stmt.offset(skip)
     if limit is not None:

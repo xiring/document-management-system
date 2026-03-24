@@ -84,8 +84,13 @@ Protected routes require `Authorization: Bearer <token>`. Access depends on role
 | `POST` | `/auth/register` | Register with JSON body `email`, `password` |
 | `POST` | `/auth/token` | OAuth2 form: `username` = email, `password` |
 | `GET` | `/auth/me` | Current user profile (any authenticated user) |
-| `POST` | `/documents/upload` | Multipart upload (requires `documents:write`) |
-| `GET` | `/documents` | Search & list: returns `{ items, total, skip, limit }`. Query: `q`, `search_mode` (`substring` \| `trigram`), `owner_id` (read_all only), `uploaded_after` / `uploaded_before`, `content_sha256_hex`, `version`, `version_min` / `version_max`, `skip`, `limit` |
+| `POST` | `/documents/upload` | Multipart upload + optional form field `folder_id` (`documents:write`) |
+| `PATCH` | `/documents/{id}` | Metadata: `folder_id`, `tag_ids`, `collection_ids` (partial JSON; `documents:write`, owner only) |
+| `GET` | `/documents` | Search & list: `{ items, total, skip, limit }`. Extra filters: `folder_id`, `tag_ids` (repeat param; AND), `collection_id`, plus filename/hash/date/version filters (see Document search below) |
+| `GET` | `/folders/tree` | Document tree: nested folders + document summaries + orphans; optional `owner_id` (read_all) |
+| `GET`–`POST` | `/folders`, `/folders/{id}` | Folder CRUD (see Folders, tags, and collections) |
+| `GET`–`POST`–`DELETE` | `/tags`, `/tags/{id}` | Tag CRUD |
+| `GET`–`POST`–`PATCH`–`DELETE` | `/collections`, `/collections/{id}`, … | Collections + document membership |
 | `GET` | `/documents/{id}` | Get metadata (own, or any if `manager`/`admin`) |
 | `POST` | `/documents/{id}/versions` | New version for **your** document only |
 | `GET` | `/documents/{id}/verify` | Content verification |
@@ -99,11 +104,19 @@ Protected routes require `Authorization: Bearer <token>`. Access depends on role
 
 The `content_sha256_hex` field in responses is the digest of **file bytes**, not the filename.
 
+### Folders, tags, and collections
+
+- **Folders** — Hierarchical: optional `parent_id` on `POST /folders` (same owner; names unique among **siblings**). `GET /folders/tree` returns nested `roots` (each node has `children`, `documents`) plus `orphan_documents` (no folder). `GET/POST /folders`, `GET/DELETE /folders/{id}`; delete requires no subfolders and no documents.
+- **Tags** — `GET/POST /tags`, `DELETE /tags/{id}`. Labels per user; attach via `PATCH /documents/{id}` with `tag_ids` (replaces the set). `POST /tags` returns existing tag if the name already exists.
+- **Collections** — named groups: `GET/POST /collections`, `GET/PATCH/DELETE /collections/{id}`, and `POST/DELETE /collections/{id}/documents/{document_id}` to add/remove a document. `PATCH /documents/{id}` with `collection_ids` replaces membership in all listed collections (omit field to leave unchanged).
+
+`DocumentOut` includes `folder_id`, `tag_ids`, and `collection_ids`. New document versions inherit folder, tags, and collections from the parent row.
+
 ### Document search (`GET /documents`)
 
 - **`q` + `search_mode=substring`** (default): case-insensitive substring match on `filename`; `%` / `_` in `q` are escaped.
 - **`q` + `search_mode=trigram`**: fuzzy match using PostgreSQL `pg_trgm` (`similarity()`). Requires the `pg_trgm` extension (the app attempts `CREATE EXTENSION` on startup; hosted DBs without superuser may log a warning and fall back to substring-only).
-- **Filters**: `owner_id` (managers/admins only), ISO datetimes for `uploaded_after` / `uploaded_before`, exact `content_sha256_hex` (64 hex chars), `version` or `version_min` / `version_max`.
+- **Filters**: `owner_id` (managers/admins only), `folder_id`, `collection_id`, `tag_ids` (repeat the query param; document must match **all** listed tags), ISO datetimes, `content_sha256_hex`, `version` / `version_min` / `version_max`.
 - **Pagination**: `skip` and optional `limit` (1–5000; omit `limit` for no cap—use carefully).
 
 ## Smart contract
@@ -124,6 +137,8 @@ app/
   permissions.py       # Dependency injection for route permissions
   blockchain_service.py # Web3 notarization helpers
   document_search.py   # Document list filters (ILIKE / pg_trgm)
+  routers/
+    organization.py    # Folders, tags, collections API
   services/
     storage.py         # Local file IO and hashing
 contracts/

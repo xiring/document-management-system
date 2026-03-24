@@ -23,6 +23,52 @@ def ensure_users_role_column() -> None:
         )
 
 
+def ensure_folder_tree_schema() -> None:
+    """Add folders.parent_id; replace flat unique with partial unique indexes (PostgreSQL)."""
+    if not settings.database_url.startswith("postgresql"):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE folders ADD COLUMN IF NOT EXISTS parent_id INTEGER REFERENCES folders(id)"))
+            conn.execute(text("ALTER TABLE folders DROP CONSTRAINT IF EXISTS uq_folders_owner_name"))
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_folder_owner_root_name "
+                    "ON folders (owner_id, name) WHERE parent_id IS NULL"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_folder_owner_parent_name "
+                    "ON folders (owner_id, parent_id, name) WHERE parent_id IS NOT NULL"
+                )
+            )
+    except Exception as e:
+        logger.warning(
+            "Folder tree schema (parent_id / unique indexes) could not be applied. Error: %s",
+            e,
+        )
+
+
+def ensure_organization_columns() -> None:
+    """Add folder_id to documents if missing (PostgreSQL; folders table must exist)."""
+    if not settings.database_url.startswith("postgresql"):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS folder_id INTEGER "
+                    "REFERENCES folders(id)"
+                )
+            )
+    except Exception as e:
+        logger.warning(
+            "Could not add documents.folder_id (ensure folders table exists via migrations). Error: %s",
+            e,
+        )
+
+
 def ensure_pg_trgm() -> None:
     """Enable pg_trgm for filename similarity search; add GIN index on documents.filename."""
     if not settings.database_url.startswith("postgresql"):

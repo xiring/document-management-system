@@ -3,10 +3,10 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 load_dotenv()
 
@@ -15,13 +15,15 @@ from app.config import settings
 from app.database import (
     Base,
     engine,
+    ensure_folder_tree_schema,
+    ensure_organization_columns,
     ensure_pg_trgm,
     ensure_users_role_column,
     get_db,
     promote_bootstrap_admin_if_configured,
 )
 from app.document_search import build_document_list_filters, document_count_query, document_list_query
-from app.models import Document, User
+from app.models import Collection, Document, Folder, Tag, User
 from app.blockchain_service import get_on_chain_owner, is_notarization_configured, notarize_hash
 from app.permissions import RequirePermission, can_access_document, has_permission
 from app.roles import Role, normalize_role
@@ -29,6 +31,7 @@ from app.schemas import (
     AdminUserCreate,
     AdminUserUpdate,
     DocumentListResponse,
+    DocumentMetadataUpdate,
     DocumentOut,
     DocumentVerifyResult,
     Token,
@@ -36,14 +39,20 @@ from app.schemas import (
     UserOut,
     UserRoleUpdate,
 )
+from app.routers.organization import collection_router, folder_router, tag_router
 from app.services.storage import read_stored_file, save_upload, sha256_bytes
 
 
 def document_to_out(doc: Document) -> DocumentOut:
+    tag_ids = [t.id for t in doc.tags] if getattr(doc, "tags", None) else []
+    collection_ids = [c.id for c in doc.collections] if getattr(doc, "collections", None) else []
     return DocumentOut(
         id=doc.id,
         filename=doc.filename,
         owner_id=doc.owner_id,
+        folder_id=doc.folder_id,
+        tag_ids=tag_ids,
+        collection_ids=collection_ids,
         upload_date=doc.upload_date,
         storage_uri=doc.storage_uri,
         content_sha256_hex=doc.file_hash.hex()
@@ -55,16 +64,30 @@ def document_to_out(doc: Document) -> DocumentOut:
     )
 
 
+def _resolve_folder_for_owner(db: Session, folder_id: int | None, owner_id: int) -> int | None:
+    if folder_id is None:
+        return None
+    f = db.get(Folder, folder_id)
+    if f is None or f.owner_id != owner_id:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    return folder_id
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     ensure_users_role_column()
+    ensure_organization_columns()
+    ensure_folder_tree_schema()
     ensure_pg_trgm()
     promote_bootstrap_admin_if_configured()
     yield
 
 
 app = FastAPI(title="DMS", lifespan=lifespan)
+app.include_router(folder_router)
+app.include_router(tag_router)
+app.include_router(collection_router)
 
 
 def _initial_role_for_email(email: str) -> str:
@@ -114,15 +137,18 @@ async def upload_document(
     current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
     db: Annotated[Session, Depends(get_db)],
     file: UploadFile = File(...),
+    folder_id: int | None = Form(default=None),
 ) -> DocumentOut:
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
+    fid = _resolve_folder_for_owner(db, folder_id, current_user.id)
     storage_uri, digest = save_upload(content, file.filename or "unnamed")
     tx_hash = notarize_hash(digest)
     doc = Document(
         filename=file.filename or "unnamed",
         owner_id=current_user.id,
+        folder_id=fid,
         storage_uri=storage_uri,
         file_hash=digest,
         blockchain_tx_hash=tx_hash,
@@ -173,6 +199,12 @@ def list_documents(
         le=5000,
         description="Max rows (default: no limit; use for pagination).",
     ),
+    folder_id: int | None = Query(default=None, description="Filter by folder id."),
+    tag_ids: list[int] | None = Query(
+        default=None,
+        description="Documents that have ALL of these tag ids (AND).",
+    ),
+    collection_id: int | None = Query(default=None, description="Filter by membership in this collection."),
 ) -> DocumentListResponse:
     if not has_permission(current_user, "documents:read"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing permission: documents:read")
@@ -186,6 +218,19 @@ def list_documents(
             detail="version_min cannot be greater than version_max",
         )
     read_all = has_permission(current_user, "documents:read_all")
+    if folder_id is not None:
+        f = db.get(Folder, folder_id)
+        if f is None or (not read_all and f.owner_id != current_user.id):
+            raise HTTPException(status_code=404, detail="Folder not found")
+    if collection_id is not None:
+        c = db.get(Collection, collection_id)
+        if c is None or (not read_all and c.owner_id != current_user.id):
+            raise HTTPException(status_code=404, detail="Collection not found")
+    if tag_ids:
+        for tid in tag_ids:
+            t = db.get(Tag, tid)
+            if t is None or (not read_all and t.owner_id != current_user.id):
+                raise HTTPException(status_code=404, detail="Tag not found")
     if owner_id is not None and not read_all:
         if owner_id != current_user.id:
             raise HTTPException(
@@ -206,6 +251,9 @@ def list_documents(
             version=version,
             version_min=version_min,
             version_max=version_max,
+            folder_id=folder_id,
+            tag_ids=tag_ids or None,
+            collection_id=collection_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -228,9 +276,70 @@ def get_document(
 ) -> DocumentOut:
     if not has_permission(current_user, "documents:read"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing permission: documents:read")
-    doc = db.get(Document, document_id)
+    doc = db.execute(
+        select(Document)
+        .options(
+            selectinload(Document.tags),
+            selectinload(Document.collections),
+            selectinload(Document.folder),
+        )
+        .where(Document.id == document_id)
+    ).scalar_one_or_none()
     if doc is None or not can_access_document(current_user, doc):
         raise HTTPException(status_code=404, detail="Document not found")
+    return document_to_out(doc)
+
+
+@app.patch("/documents/{document_id}", response_model=DocumentOut)
+def update_document_metadata(
+    document_id: int,
+    body: DocumentMetadataUpdate,
+    current_user: Annotated[User, Depends(RequirePermission("documents:write"))],
+    db: Annotated[Session, Depends(get_db)],
+) -> DocumentOut:
+    doc = db.execute(
+        select(Document)
+        .options(
+            selectinload(Document.tags),
+            selectinload(Document.collections),
+        )
+        .where(Document.id == document_id)
+    ).scalar_one_or_none()
+    if doc is None or doc.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    patch = body.model_dump(exclude_unset=True)
+    if "folder_id" in patch:
+        if patch["folder_id"] is None:
+            doc.folder_id = None
+        else:
+            doc.folder_id = _resolve_folder_for_owner(db, patch["folder_id"], current_user.id)
+    if "tag_ids" in patch:
+        tids = patch["tag_ids"]
+        if not tids:
+            doc.tags = []
+        else:
+            tags = db.execute(
+                select(Tag).where(Tag.id.in_(tids), Tag.owner_id == current_user.id)
+            ).scalars().all()
+            if len(tags) != len(set(tids)):
+                raise HTTPException(status_code=400, detail="Invalid or duplicate tag ids")
+            doc.tags = list(tags)
+    if "collection_ids" in patch:
+        cids = patch["collection_ids"]
+        if not cids:
+            doc.collections = []
+        else:
+            cols = db.execute(
+                select(Collection).where(
+                    Collection.id.in_(cids),
+                    Collection.owner_id == current_user.id,
+                )
+            ).scalars().all()
+            if len(cols) != len(set(cids)):
+                raise HTTPException(status_code=400, detail="Invalid or duplicate collection ids")
+            doc.collections = list(cols)
+    db.commit()
+    db.refresh(doc)
     return document_to_out(doc)
 
 
@@ -241,7 +350,11 @@ async def upload_new_version(
     db: Annotated[Session, Depends(get_db)],
     file: UploadFile = File(...),
 ) -> DocumentOut:
-    parent = db.get(Document, document_id)
+    parent = db.execute(
+        select(Document)
+        .options(selectinload(Document.tags), selectinload(Document.collections))
+        .where(Document.id == document_id)
+    ).scalar_one_or_none()
     if parent is None or parent.owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Document not found")
     content = await file.read()
@@ -252,6 +365,7 @@ async def upload_new_version(
     new_doc = Document(
         filename=file.filename or parent.filename,
         owner_id=current_user.id,
+        folder_id=parent.folder_id,
         storage_uri=storage_uri,
         file_hash=digest,
         blockchain_tx_hash=tx_hash,
@@ -259,6 +373,9 @@ async def upload_new_version(
         previous_version_id=parent.id,
     )
     db.add(new_doc)
+    db.flush()
+    new_doc.tags = list(parent.tags)
+    new_doc.collections = list(parent.collections)
     db.commit()
     db.refresh(new_doc)
     return document_to_out(new_doc)
