@@ -87,6 +87,16 @@ class DocumentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class DocumentListResponse(BaseModel):
+    items: list[DocumentOut]
+    total: int
+    skip: int
+    limit: int | None = Field(
+        default=None,
+        description="Applied page size; null means no LIMIT (all matching rows after skip).",
+    )
+
+
 class DocumentVerifyResult(BaseModel):
     document_id: int
     content_matches_stored_hash: bool = Field(

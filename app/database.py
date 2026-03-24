@@ -1,9 +1,12 @@
+import logging
 from collections.abc import Generator
 
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 engine = create_engine(settings.database_url, pool_pre_ping=True)
 
@@ -18,6 +21,29 @@ def ensure_users_role_column() -> None:
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(32) NOT NULL DEFAULT 'user'"
             )
         )
+
+
+def ensure_pg_trgm() -> None:
+    """Enable pg_trgm for filename similarity search; add GIN index on documents.filename."""
+    if not settings.database_url.startswith("postgresql"):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_documents_filename_trgm "
+                    "ON documents USING gin (filename gin_trgm_ops)"
+                )
+            )
+    except Exception as e:
+        logger.warning(
+            "Could not enable pg_trgm or create trigram index (needs DB superuser or extension). "
+            "Substring search still works; trigram mode may fail. Error: %s",
+            e,
+        )
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

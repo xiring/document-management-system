@@ -85,7 +85,7 @@ Protected routes require `Authorization: Bearer <token>`. Access depends on role
 | `POST` | `/auth/token` | OAuth2 form: `username` = email, `password` |
 | `GET` | `/auth/me` | Current user profile (any authenticated user) |
 | `POST` | `/documents/upload` | Multipart upload (requires `documents:write`) |
-| `GET` | `/documents` | List documents (own only, or all if `manager`/`admin`) |
+| `GET` | `/documents` | Search & list: returns `{ items, total, skip, limit }`. Query: `q`, `search_mode` (`substring` \| `trigram`), `owner_id` (read_all only), `uploaded_after` / `uploaded_before`, `content_sha256_hex`, `version`, `version_min` / `version_max`, `skip`, `limit` |
 | `GET` | `/documents/{id}` | Get metadata (own, or any if `manager`/`admin`) |
 | `POST` | `/documents/{id}/versions` | New version for **your** document only |
 | `GET` | `/documents/{id}/verify` | Content verification |
@@ -98,6 +98,13 @@ Protected routes require `Authorization: Bearer <token>`. Access depends on role
 | `GET` | `/health` | Liveness check |
 
 The `content_sha256_hex` field in responses is the digest of **file bytes**, not the filename.
+
+### Document search (`GET /documents`)
+
+- **`q` + `search_mode=substring`** (default): case-insensitive substring match on `filename`; `%` / `_` in `q` are escaped.
+- **`q` + `search_mode=trigram`**: fuzzy match using PostgreSQL `pg_trgm` (`similarity()`). Requires the `pg_trgm` extension (the app attempts `CREATE EXTENSION` on startup; hosted DBs without superuser may log a warning and fall back to substring-only).
+- **Filters**: `owner_id` (managers/admins only), ISO datetimes for `uploaded_after` / `uploaded_before`, exact `content_sha256_hex` (64 hex chars), `version` or `version_min` / `version_max`.
+- **Pagination**: `skip` and optional `limit` (1–5000; omit `limit` for no cap—use carefully).
 
 ## Smart contract
 
@@ -116,6 +123,7 @@ app/
   roles.py             # Role enum and permission sets
   permissions.py       # Dependency injection for route permissions
   blockchain_service.py # Web3 notarization helpers
+  document_search.py   # Document list filters (ILIKE / pg_trgm)
   services/
     storage.py         # Local file IO and hashing
 contracts/

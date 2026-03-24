@@ -1,8 +1,9 @@
 from contextlib import asynccontextmanager
-from typing import Annotated
+from datetime import datetime
+from typing import Annotated, Literal
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -11,7 +12,15 @@ load_dotenv()
 
 from app.auth import create_access_token, get_current_user, hash_password, verify_password
 from app.config import settings
-from app.database import Base, engine, ensure_users_role_column, get_db, promote_bootstrap_admin_if_configured
+from app.database import (
+    Base,
+    engine,
+    ensure_pg_trgm,
+    ensure_users_role_column,
+    get_db,
+    promote_bootstrap_admin_if_configured,
+)
+from app.document_search import build_document_list_filters, document_count_query, document_list_query
 from app.models import Document, User
 from app.blockchain_service import get_on_chain_owner, is_notarization_configured, notarize_hash
 from app.permissions import RequirePermission, can_access_document, has_permission
@@ -19,6 +28,7 @@ from app.roles import Role, normalize_role
 from app.schemas import (
     AdminUserCreate,
     AdminUserUpdate,
+    DocumentListResponse,
     DocumentOut,
     DocumentVerifyResult,
     Token,
@@ -49,6 +59,7 @@ def document_to_out(doc: Document) -> DocumentOut:
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     ensure_users_role_column()
+    ensure_pg_trgm()
     promote_bootstrap_admin_if_configured()
     yield
 
@@ -124,20 +135,89 @@ async def upload_document(
     return document_to_out(doc)
 
 
-@app.get("/documents", response_model=list[DocumentOut])
+@app.get("/documents", response_model=DocumentListResponse)
 def list_documents(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
-) -> list[DocumentOut]:
+    q: str | None = Query(
+        default=None,
+        description="Search filename: substring (ILIKE) or trigram similarity, see search_mode.",
+    ),
+    search_mode: Literal["substring", "trigram"] = Query(
+        default="substring",
+        description="substring: case-insensitive contains. trigram: pg_trgm similarity (fuzzy).",
+    ),
+    owner_id: int | None = Query(
+        default=None,
+        description="Filter by owner user id (only allowed for manager/admin with read_all).",
+    ),
+    uploaded_after: datetime | None = Query(
+        default=None,
+        description="Include documents uploaded on or after this instant (ISO 8601).",
+    ),
+    uploaded_before: datetime | None = Query(
+        default=None,
+        description="Include documents uploaded on or before this instant (ISO 8601).",
+    ),
+    content_sha256_hex: str | None = Query(
+        default=None,
+        description="Exact match on stored SHA-256 content hash (64 hex chars).",
+    ),
+    version: int | None = Query(default=None, description="Exact version number."),
+    version_min: int | None = Query(default=None, ge=1),
+    version_max: int | None = Query(default=None, ge=1),
+    skip: int = Query(default=0, ge=0),
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=5000,
+        description="Max rows (default: no limit; use for pagination).",
+    ),
+) -> DocumentListResponse:
     if not has_permission(current_user, "documents:read"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing permission: documents:read")
-    if has_permission(current_user, "documents:read_all"):
-        rows = db.execute(select(Document)).scalars().all()
-    else:
-        rows = (
-            db.execute(select(Document).where(Document.owner_id == current_user.id)).scalars().all()
+    if (
+        version_min is not None
+        and version_max is not None
+        and version_min > version_max
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="version_min cannot be greater than version_max",
         )
-    return [document_to_out(d) for d in rows]
+    read_all = has_permission(current_user, "documents:read_all")
+    if owner_id is not None and not read_all:
+        if owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="owner_id filter requires documents:read_all or must match your user id.",
+            )
+
+    try:
+        conditions = build_document_list_filters(
+            read_all=read_all,
+            current_user_id=current_user.id,
+            owner_id=owner_id,
+            q=q,
+            search_mode=search_mode,
+            uploaded_after=uploaded_after,
+            uploaded_before=uploaded_before,
+            content_sha256_hex=content_sha256_hex,
+            version=version,
+            version_min=version_min,
+            version_max=version_max,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    total = db.execute(document_count_query(conditions)).scalar_one()
+    rows = db.execute(document_list_query(conditions, skip=skip, limit=limit)).scalars().all()
+    return DocumentListResponse(
+        items=[document_to_out(d) for d in rows],
+        total=int(total),
+        skip=skip,
+        limit=limit,
+    )
 
 
 @app.get("/documents/{document_id}", response_model=DocumentOut)
